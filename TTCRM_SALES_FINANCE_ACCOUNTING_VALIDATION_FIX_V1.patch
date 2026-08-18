@@ -1,0 +1,9 @@
+diff --git a/server/routers.ts b/server/routers.ts
+--- a/server/routers.ts
++++ b/server/routers.ts
+@@ -775,1 +775,4 @@
+-const userRoleSchema = z.enum(APP_USER_ROLES);
++const userRoleSchema = z.union([
++  z.enum(APP_USER_ROLES),
++  z.literal("SalesFinanceAccounting"),
++]);
