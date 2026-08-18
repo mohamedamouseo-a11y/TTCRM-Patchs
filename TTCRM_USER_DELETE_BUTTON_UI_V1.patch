@@ -1,0 +1,18 @@
+diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
+--- a/client/src/pages/AdminSettings.tsx
++++ b/client/src/pages/AdminSettings.tsx
+@@ -584,11 +584,11 @@
+                             {u.id !== user?.id && (
+                               <Button
+-                                variant="ghost"
++                                variant="outline"
+                                 size="sm"
+-                                className="h-7 gap-1 text-xs text-destructive hover:text-destructive hover:bg-destructive/10"
++                                className="h-8 gap-1.5 rounded-lg border-red-200 bg-red-50/50 px-2.5 text-xs font-medium text-red-600 shadow-none transition-colors hover:border-red-300 hover:bg-red-100 hover:text-red-700 dark:border-red-900/60 dark:bg-red-950/20 dark:text-red-400 dark:hover:border-red-800 dark:hover:bg-red-950/40 dark:hover:text-red-300"
+                                 onClick={() => handleDeleteUser(u)}
+                                 disabled={deleteUserMutation.isPending}
+                               >
+-                                <Trash2 size={12} /> {isRTL ? "حذف" : "Delete"}
++                                <Trash2 size={13} /> {isRTL ? "حذف" : "Delete"}
+                               </Button>
+                             )}
