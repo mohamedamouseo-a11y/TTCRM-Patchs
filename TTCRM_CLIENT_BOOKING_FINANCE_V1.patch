@@ -1,0 +1,375 @@
+diff --git a/server/services/financeService.ts b/server/services/financeService.ts
+--- a/server/services/financeService.ts
++++ b/server/services/financeService.ts
+@@ -132,11 +135,13 @@
+ export async function getFinanceAccess(actor: FinanceActor) {
+   const financeRole = await getFinanceRole(actor);
+   if (financeRole === "NoAccess") {
+     throw new TRPCError({ code: "FORBIDDEN", message: "ليس لديك صلاحية للوصول إلى المالية والحسابات" });
+   }
++  const isSalesUser = BUILTIN_SALES_ROLES.has(String(actor.role ?? "").toLowerCase()) || financeRole === "Sales";
+   return {
+     userId: actor.id,
+     financeRole,
++    isSalesUser,
+     canViewAll: FULL_ACCESS_ROLES.has(financeRole),
+     canManageTransactions: FULL_ACCESS_ROLES.has(financeRole),
+     canApproveManagerStage: financeRole === "FinanceManager",
+@@ -205,10 +208,10 @@
+   `));
+   if (!user) throw new TRPCError({ code: "BAD_REQUEST", message: "موظف المبيعات المحدد غير متاح" });
+-  const effectiveRole = String(user.role ?? "").toLowerCase() === "admin"
+-    ? "Owner"
+-    : (user.financeRole ?? (BUILTIN_SALES_ROLES.has(String(user.role ?? "").toLowerCase()) ? "Sales" : "NoAccess"));
+-  if (effectiveRole !== "Sales") {
++  const isSalesCapable =
++    BUILTIN_SALES_ROLES.has(String(user.role ?? "").toLowerCase()) ||
++    String(user.financeRole ?? "") === "Sales";
++  if (!isSalesCapable) {
+     throw new TRPCError({ code: "BAD_REQUEST", message: "المستخدم المحدد ليس لديه دور مبيعات في نظام المالية" });
+   }
+   return user;
+ }
+@@ -226,7 +229,8 @@
+   clientId: number | null,
+   leadId: number | null,
+ ) {
+   if (!clientId && !leadId) {
+-    throw new TRPCError({ code: "BAD_REQUEST", message: "يجب ربط الحجز بعميل أو عميل محتمل موجود في النظام" });
++    // Walk-in / guest booking. customerName + phone are still mandatory.
++    return;
+   }
+   if (clientId) {
+@@ -280,8 +283,14 @@
+   const roleMap = new Map(extractRows<any>(roles).map((row) => [Number(row.userId), row.financeRole]));
+-  const mappedUsers = extractRows<any>(users).map((user) => ({
+-    ...user,
+-    financeRole: String(user.role).toLowerCase() === "admin"
+-      ? "Owner"
+-      : (roleMap.get(Number(user.id)) ?? (BUILTIN_SALES_ROLES.has(String(user.role).toLowerCase()) ? "Sales" : "NoAccess")),
+-  }));
++  const mappedUsers = extractRows<any>(users).map((user) => {
++    const baseRole = String(user.role ?? "").toLowerCase();
++    const explicitFinanceRole = roleMap.get(Number(user.id)) as FinanceRole | undefined;
++    return {
++      ...user,
++      financeRole: baseRole === "admin"
++        ? "Owner"
++        : (explicitFinanceRole ?? (BUILTIN_SALES_ROLES.has(baseRole) ? "Sales" : "NoAccess")),
++      // Finance permission is additive to the user's base role.
++      isSalesUser: BUILTIN_SALES_ROLES.has(baseRole) || explicitFinanceRole === "Sales",
++    };
++  });
+   const setupWarnings: string[] = [];
+@@ -660,6 +675,120 @@
+     return { id };
+   });
+ }
+
++export async function adjustFinanceBookingBalance(actor: FinanceActor, input: any) {
++  await assertFinanceRole(actor, ["Owner", "FinanceManager", "Accountant"]);
++  const db = requireDb(await getDb());
++  const bookingId = Number(input.bookingId);
++  const targetCollected = new Decimal(normalizeMoney(input.collectedAmount, "المبلغ المحصل"));
++  const targetRemaining = new Decimal(normalizeMoney(input.remainingAmount, "المبلغ المتبقي"));
++  const reason = cleanText(input.reason, 1000, true)!;
++
++  return db.transaction(async (tx: any) => {
++    const booking = first<any>(await tx.execute(sql`
++      SELECT id, bookingNumber, status, netAmount
++      FROM finance_bookings
++      WHERE id=${bookingId} AND deletedAt IS NULL
++      FOR UPDATE
++    `));
++    if (!booking) throw new TRPCError({ code: "NOT_FOUND", message: "الحجز غير موجود" });
++    if (booking.status !== "Confirmed") {
++      throw new TRPCError({ code: "CONFLICT", message: "يمكن تعديل المحصل والمتبقي للحجز المعتمد فقط" });
++    }
++
++    const totals = first<any>(await tx.execute(sql`
++      SELECT
++        COALESCE((SELECT SUM(amount) FROM finance_collections
++                  WHERE bookingId=${bookingId} AND deletedAt IS NULL),0) AS paid,
++        COALESCE((SELECT SUM(amount + cancellationFee) FROM finance_refunds
++                  WHERE bookingId=${bookingId} AND status='Approved'),0) AS allocatedRefunds,
++        COALESCE((SELECT COUNT(*) FROM finance_refunds
++                  WHERE bookingId=${bookingId}
++                    AND status IN ('PendingFinanceManager','PendingOwner')),0) AS pendingRefunds
++    `));
++    if (Number(totals?.pendingRefunds ?? 0) > 0) {
++      throw new TRPCError({ code: "CONFLICT", message: "لا يمكن تعديل الرصيد أثناء وجود طلب استرداد قيد الاعتماد" });
++    }
++
++    const netAmount = new Decimal(booking.netAmount ?? 0).toDecimalPlaces(2);
++    if (!targetCollected.plus(targetRemaining).equals(netAmount)) {
++      throw new TRPCError({
++        code: "BAD_REQUEST",
++        message: "المبلغ المحصل + المبلغ المتبقي يجب أن يساويا صافي قيمة الحجز",
++      });
++    }
++    if (targetCollected.greaterThan(netAmount)) {
++      throw new TRPCError({ code: "BAD_REQUEST", message: "المبلغ المحصل لا يمكن أن يتجاوز صافي الحجز" });
++    }
++
++    const allocatedRefunds = new Decimal(totals?.allocatedRefunds ?? 0);
++    if (targetCollected.lessThan(allocatedRefunds)) {
++      throw new TRPCError({
++        code: "BAD_REQUEST",
++        message: "لا يمكن خفض المحصل لأقل من قيمة الاستردادات المعتمدة المرتبطة بالحجز",
++      });
++    }
++
++    const currentCollected = new Decimal(totals?.paid ?? 0).toDecimalPlaces(2);
++    const delta = targetCollected.minus(currentCollected).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
++    if (delta.isZero()) {
++      return {
++        success: true,
++        adjusted: false,
++        collectedAmount: targetCollected.toFixed(2),
++        remainingAmount: targetRemaining.toFixed(2),
++      };
++    }
++
++    await tx.execute(sql`
++      INSERT INTO finance_payment_methods (name, isActive, sortOrder)
++      VALUES ('تسوية رصيد', 1, 990)
++      ON DUPLICATE KEY UPDATE isActive=1, sortOrder=VALUES(sortOrder), updatedAt=NOW()
++    `);
++    const adjustmentMethod = first<any>(await tx.execute(sql`
++      SELECT id FROM finance_payment_methods WHERE name='تسوية رصيد' LIMIT 1
++    `));
++    if (!adjustmentMethod?.id) {
++      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "تعذر تجهيز طريقة تسوية الرصيد" });
++    }
++
++    const adjustmentNote = cleanText(`تسوية رصيد يدوية: ${reason}`, 2000, true)!;
++    const result = await tx.execute(sql`
++      INSERT INTO finance_collections
++        (bookingId, amount, paymentMethodId, paymentDate, notes, createdBy)
++      VALUES
++        (${bookingId}, ${delta.toFixed(2)}, ${Number(adjustmentMethod.id)}, CURRENT_DATE, ${adjustmentNote}, ${actor.id})
++    `);
++    const adjustmentId = insertId(result);
++
++    await writeFinanceAudit(
++      tx,
++      actor,
++      "FINANCE_BOOKING_BALANCE_ADJUSTED",
++      "finance_booking",
++      bookingId,
++      booking.bookingNumber,
++      { reason, adjustmentId, delta: delta.toFixed(2) },
++      {
++        collectedAmount: currentCollected.toFixed(2),
++        remainingAmount: Decimal.max(netAmount.minus(currentCollected), 0).toFixed(2),
++      },
++      {
++        collectedAmount: targetCollected.toFixed(2),
++        remainingAmount: targetRemaining.toFixed(2),
++      },
++    );
++
++    return {
++      success: true,
++      adjusted: true,
++      adjustmentId,
++      delta: delta.toFixed(2),
++      collectedAmount: targetCollected.toFixed(2),
++      remainingAmount: targetRemaining.toFixed(2),
++    };
++  });
++}
++
+ export async function addFinanceBookingCost(actor: FinanceActor, input: any) {
+   await assertFinanceRole(actor, ["Owner", "FinanceManager", "Accountant"]);
+diff --git a/server/financeRouter.ts b/server/financeRouter.ts
+--- a/server/financeRouter.ts
++++ b/server/financeRouter.ts
+@@ -2,5 +2,6 @@
+ import { protectedProcedure, router } from "./_core/trpc";
+ import {
++  adjustFinanceBookingBalance,
+   addFinanceBookingCost,
+   addFinanceCollection,
+   confirmFinanceBooking,
+@@ -62,5 +63,14 @@
+     }))
+     .mutation(({ ctx, input }) => addFinanceCollection(actor(ctx), input)),
+
++  adjustBookingBalance: protectedProcedure
++    .input(z.object({
++      bookingId: z.number().int().positive(),
++      collectedAmount: money,
++      remainingAmount: money,
++      reason: z.string().trim().min(3).max(1000),
++    }))
++    .mutation(({ ctx, input }) => adjustFinanceBookingBalance(actor(ctx), input)),
++
+   addBookingCost: protectedProcedure
+     .input(z.object({
+diff --git a/client/src/pages/FinanceDashboard.tsx b/client/src/pages/FinanceDashboard.tsx
+--- a/client/src/pages/FinanceDashboard.tsx
++++ b/client/src/pages/FinanceDashboard.tsx
+@@ -34,4 +34,5 @@
+         FINANCE_BOOKING_UPDATED: ft("\u062A\u0639\u062F\u064A\u0644 \u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062D\u062C\u0632"),
+         FINANCE_BOOKING_CONFIRMED: ft("\u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062D\u062C\u0632"),
+         FINANCE_COLLECTION_ADDED: ft("\u0625\u0636\u0627\u0641\u0629 \u062A\u062D\u0635\u064A\u0644"),
++        FINANCE_BOOKING_BALANCE_ADJUSTED: ft("تعديل المحصل والمتبقي"),
+         FINANCE_BOOKING_COST_ADDED: ft("\u0625\u0636\u0627\u0641\u0629 \u062A\u0643\u0644\u0641\u0629 \u0645\u0628\u0627\u0634\u0631\u0629"),
+@@ -175,4 +176,5 @@
+     const updateBooking = trpc.finance.updateBooking.useMutation(mutationOptions(ft("\u062A\u0645 \u062A\u062D\u062F\u064A\u062B \u0627\u0644\u062D\u062C\u0632"), closeBookingForm));
+     const confirmBooking = trpc.finance.confirmBooking.useMutation(mutationOptions(ft("\u062A\u0645 \u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062D\u062C\u0632")));
+     const addCollection = trpc.finance.addCollection.useMutation(mutationOptions(ft("\u062A\u0645 \u062A\u0633\u062C\u064A\u0644 \u0627\u0644\u062A\u062D\u0635\u064A\u0644"), () => setCollectionForm({ amount: "", paymentMethodId: 0, paymentDate: today(), notes: "" })));
++    const adjustBalance = trpc.finance.adjustBookingBalance.useMutation(mutationOptions(ft("تم حفظ تعديل المحصل والمتبقي")));
+     const addCost = trpc.finance.addBookingCost.useMutation(mutationOptions(ft("\u062A\u0645 \u062A\u0633\u062C\u064A\u0644 \u062A\u0643\u0644\u0641\u0629 \u0627\u0644\u062D\u062C\u0632"), () => setCostForm({ supplierName: "", description: "", amount: "", paymentMethodId: 0, costDate: today() })));
+@@ -184,5 +186,7 @@
+     useEffect(() => {
+         if (!bookingForm.serviceId && bootstrap.data?.services?.length) {
+-            setBookingForm((prev) => ({ ...prev, serviceId: Number(bootstrap.data!.services.find((x: any) => x.isActive)?.id ?? 0) }));
++            const activeServices = bootstrap.data.services.filter((x: any) => x.isActive);
++            const defaultService = activeServices.find((x: any) => String(x.name || "").trim() === "عمرة") ?? activeServices[0];
++            setBookingForm((prev) => ({ ...prev, serviceId: Number(defaultService?.id ?? 0) }));
+         }
+     }, [bootstrap.data?.services]);
+@@ -580,2 +584,2 @@
+-            {access?.canViewAll && <Field label={ft("\u0645\u0648\u0638\u0641 \u0627\u0644\u0645\u0628\u064A\u0639\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644")}><Select value={bookingForm.salesUserId ? String(bookingForm.salesUserId) : ""} onValueChange={(v) => setBookingForm((p) => ({ ...p, salesUserId: Number(v) }))}><SelectTrigger><SelectValue placeholder={ft("\u0627\u062E\u062A\u0631 \u0627\u0644\u0645\u0648\u0638\u0641")}/></SelectTrigger><SelectContent>{bootstrap.data?.users?.filter((x: any) => x.financeRole === "Sales").map((x: any) => <SelectItem key={x.id} value={String(x.id)}>{x.name || `${ft("مستخدم #")}${x.id}`}</SelectItem>)}</SelectContent></Select></Field>}
++            {access?.canViewAll && <Field label={ft("\u0645\u0648\u0638\u0641 \u0627\u0644\u0645\u0628\u064A\u0639\u0627\u062A \u0627\u0644\u0645\u0633\u0624\u0648\u0644")}><Select value={bookingForm.salesUserId ? String(bookingForm.salesUserId) : ""} onValueChange={(v) => setBookingForm((p) => ({ ...p, salesUserId: Number(v) }))}><SelectTrigger><SelectValue placeholder={ft("\u0627\u062E\u062A\u0631 \u0627\u0644\u0645\u0648\u0638\u0641")}/></SelectTrigger><SelectContent>{bootstrap.data?.users?.filter((x: any) => x.isSalesUser).map((x: any) => <SelectItem key={x.id} value={String(x.id)}>{x.name || `${ft("مستخدم #")}${x.id}`}</SelectItem>)}</SelectContent></Select></Field>}
+             <Field label={ft("\u0631\u0642\u0645 \u0627\u0644\u062D\u062C\u0632 \u0627\u0644\u062E\u0627\u0631\u062C\u064A (\u0627\u062E\u062A\u064A\u0627\u0631\u064A)")}><Input value={bookingForm.pnr} onChange={(e) => setBookingForm((p) => ({ ...p, pnr: e.target.value }))}/></Field>
+@@ -590,3 +594,3 @@
+-          <DialogFooter><Button variant="outline" onClick={closeBookingForm}>{ft("\u0625\u0644\u063A\u0627\u0621")}</Button><Button disabled={createBooking.isPending || updateBooking.isPending || (!bookingForm.clientId && !bookingForm.leadId) || !bookingForm.customerName || !bookingForm.phone || !bookingForm.serviceId || !bookingForm.grossAmount || (!!access?.canViewAll && !bookingForm.salesUserId)} onClick={() => { const payload = { ...bookingForm, dueDate: bookingForm.dueDate || null, pnr: bookingForm.pnr || null, notes: bookingForm.notes || null }; editingBookingId ? updateBooking.mutate({ id: editingBookingId, ...payload }) : createBooking.mutate(payload); }}>{(createBooking.isPending || updateBooking.isPending) && <Loader2 className="ml-2 h-4 w-4 animate-spin"/>}{editingBookingId ? ft("\u062D\u0641\u0638 \u0627\u0644\u062A\u0639\u062F\u064A\u0644\u0627\u062A") : ft("\u062D\u0641\u0638 \u0627\u0644\u062D\u062C\u0632")}</Button></DialogFooter>
++          <DialogFooter className="border-t pt-4"><Button variant="outline" onClick={closeBookingForm}>{ft("\u0625\u0644\u063A\u0627\u0621")}</Button><Button size="lg" className="min-w-44 text-base font-bold shadow-md" disabled={createBooking.isPending || updateBooking.isPending || !bookingForm.customerName || !bookingForm.phone || !bookingForm.serviceId || !bookingForm.grossAmount || (!!access?.canViewAll && !bookingForm.salesUserId)} onClick={() => { const payload = { ...bookingForm, dueDate: bookingForm.dueDate || null, pnr: bookingForm.pnr || null, notes: bookingForm.notes || null }; editingBookingId ? updateBooking.mutate({ id: editingBookingId, ...payload }) : createBooking.mutate(payload); }}>{(createBooking.isPending || updateBooking.isPending) && <Loader2 className="ml-2 h-4 w-4 animate-spin"/>}{editingBookingId ? ft("\u062D\u0641\u0638 \u0627\u0644\u062A\u0639\u062F\u064A\u0644\u0627\u062A") : ft("\u062D\u0641\u0638 \u0627\u0644\u062D\u062C\u0632")}</Button></DialogFooter>
+         </DialogContent>
+       </Dialog>
+@@ -650,4 +659,21 @@
+             <div className="flex flex-wrap gap-2">
+               {canManage && bookingDetails.data.booking.status === "Draft" && <Button onClick={() => confirmBooking.mutate({ id: selectedBookingId! })}><CheckCircle2 className="me-2 h-4 w-4"/>{ft("\u0627\u0639\u062A\u0645\u0627\u062F \u0627\u0644\u062D\u062C\u0632")}</Button>}
+               {(bookingDetails.data.booking.status === "Draft" || ["Owner", "FinanceManager"].includes(access?.financeRole || "")) && <Button variant="outline" onClick={() => { const b: any = bookingDetails.data!.booking; setEditingBookingId(Number(b.id)); setBookingForm({ clientId: b.clientId ? Number(b.clientId) : null, leadId: b.leadId ? Number(b.leadId) : null, customerName: b.customerName || "", phone: b.phone || "", serviceId: Number(b.serviceId), pnr: b.pnr || "", bookingDate: b.bookingDate, dueDate: b.dueDate || "", salesUserId: b.salesUserId ? Number(b.salesUserId) : null, grossAmount: String(b.grossAmount ?? ""), discountAmount: String(b.discountAmount ?? "0"), notes: b.notes || "" }); setSelectedBookingId(null); setBookingOpen(true); }}><FileText className="me-2 h-4 w-4"/>{ft("\u062A\u0639\u062F\u064A\u0644 \u0628\u064A\u0627\u0646\u0627\u062A \u0627\u0644\u062D\u062C\u0632")}</Button>}
++              {canManage && bookingDetails.data.booking.status === "Confirmed" && Number(bookingDetails.data.booking.pendingRefundCount || 0) === 0 && <Button variant="outline" disabled={adjustBalance.isPending} onClick={() => {
++                const net = Number(bookingDetails.data!.booking.netAmount || 0);
++                const currentCollected = Number(bookingDetails.data!.booking.paidAmount || 0);
++                const currentRemaining = Number(bookingDetails.data!.booking.remainingAmount || 0);
++                const collectedInput = window.prompt(ft("المبلغ المحصل"), currentCollected.toFixed(2));
++                if (collectedInput === null) return;
++                const collected = Number(collectedInput);
++                if (!Number.isFinite(collected) || collected < 0 || collected > net) return toast.error(ft("قيمة المبلغ المحصل غير صحيحة"));
++                const suggestedRemaining = Math.max(0, net - collected);
++                const remainingInput = window.prompt(ft("المبلغ المتبقي"), suggestedRemaining.toFixed(2));
++                if (remainingInput === null) return;
++                const remaining = Number(remainingInput);
++                if (!Number.isFinite(remaining) || remaining < 0 || Math.abs((collected + remaining) - net) > 0.009) return toast.error(ft("المحصل + المتبقي يجب أن يساويا صافي الحجز"));
++                const reason = window.prompt(ft("سبب تعديل الرصيد"), "");
++                if (!reason || reason.trim().length < 3) return toast.error(ft("يرجى كتابة سبب التعديل"));
++                adjustBalance.mutate({ bookingId: selectedBookingId!, collectedAmount: collected.toFixed(2), remainingAmount: remaining.toFixed(2), reason: reason.trim() });
++              }}>{adjustBalance.isPending && <Loader2 className="me-2 h-4 w-4 animate-spin"/>}{ft("تعديل المحصل والمتبقي")}</Button>}
+             </div>
+diff --git a/client/src/components/FinanceSettingsTab.tsx b/client/src/components/FinanceSettingsTab.tsx
+--- a/client/src/components/FinanceSettingsTab.tsx
++++ b/client/src/components/FinanceSettingsTab.tsx
+@@ -175,5 +175,10 @@
+             <CardTitle className="flex items-center gap-2 text-base">
+               <UserRoundCog className="h-5 w-5" />
+               {isRTL ? "صلاحيات فريق المالية" : "Finance team permissions"}
+             </CardTitle>
++            <p className="text-xs text-muted-foreground">
++              {isRTL
++                ? "الصلاحية المالية تضاف إلى دور المستخدم الأساسي ولا تستبدله؛ يمكن لوكيل المبيعات أن يحتفظ بالمبيعات مع صلاحية الحسابات والمالية."
++                : "Finance permission is additive to the base role; a Sales Agent can keep sales access while also having Finance & Accounting access."}
++            </p>
+           </CardHeader>
+@@ -190,4 +195,7 @@
+                 <div>
+                   <p className="font-medium">{user.name || `${isRTL ? "مستخدم" : "User"} #${user.id}`}</p>
+-                  <p className="text-xs text-muted-foreground">{user.email || user.role}</p>
++                  <p className="text-xs text-muted-foreground">
++                    {user.email || user.role}
++                    {user.isSalesUser ? (isRTL ? " • يحتفظ بصلاحية وكيل المبيعات" : " • keeps Sales Agent access") : ""}
++                  </p>
+                 </div>
+@@ -214,4 +214,4 @@
+                     <SelectItem value="Owner">{isRTL ? "المالك" : "Owner"}</SelectItem>
+                     <SelectItem value="FinanceManager">{isRTL ? "مدير المالية" : "Finance Manager"}</SelectItem>
+-                    <SelectItem value="Accountant">{isRTL ? "محاسب" : "Accountant"}</SelectItem>
++                    <SelectItem value="Accountant">{isRTL ? "الحسابات والمالية" : "Finance & Accounting"}</SelectItem>
+                     <SelectItem value="Sales">{isRTL ? "مبيعات" : "Sales"}</SelectItem>
+diff --git a/scripts/apply-finance-client-booking-v1-migration.ts b/scripts/apply-finance-client-booking-v1-migration.ts
+new file mode 100644
+--- /dev/null
++++ b/scripts/apply-finance-client-booking-v1-migration.ts
+@@ -0,0 +1,68 @@
++import "dotenv/config";
++import { sql } from "drizzle-orm";
++import { getDb } from "../server/db";
++
++const APPLY = process.argv.includes("--apply");
++
++const services = [
++  ["عمرة", 1],
++  ["حج قرعة", 10],
++  ["حج مباشر", 20],
++  ["تأشيرة سياحية", 30],
++  ["حجز تذكرة طيران", 40],
++  ["حجز فندق", 50],
++  ["خدمات النقل", 60],
++] as const;
++
++async function main() {
++  const db = await getDb();
++  if (!db) throw new Error("DATABASE_URL is not configured or database is unavailable");
++
++  if (!APPLY) {
++    console.log("DRY_RUN finance_client_booking_v1");
++    console.log("Would seed 7 requested booking services and the balance-adjustment payment method.");
++    console.log("Default service in the UI will be عمرة.");
++    console.log("Re-run with --apply to execute.");
++    return;
++  }
++
++  for (const [name, sortOrder] of services) {
++    await db.execute(sql`
++      INSERT INTO finance_services (name, isActive, sortOrder)
++      VALUES (${name}, 1, ${sortOrder})
++      ON DUPLICATE KEY UPDATE isActive=1, sortOrder=VALUES(sortOrder), updatedAt=NOW()
++    `);
++  }
++
++  await db.execute(sql`
++    INSERT INTO finance_payment_methods (name, isActive, sortOrder)
++    VALUES ('تسوية رصيد', 1, 990)
++    ON DUPLICATE KEY UPDATE isActive=1, sortOrder=VALUES(sortOrder), updatedAt=NOW()
++  `);
++
++  const verification = await db.execute(sql`
++    SELECT name
++    FROM finance_services
++    WHERE isActive=1 AND name IN
++      ('عمرة','حج قرعة','حج مباشر','تأشيرة سياحية','حجز تذكرة طيران','حجز فندق','خدمات النقل')
++  `);
++  const foundServices = new Set((((verification as any)[0] ?? []) as any[]).map((row) => String(row.name)));
++  const missing = services.map(([name]) => name).filter((name) => !foundServices.has(name));
++  if (missing.length) throw new Error(`Missing finance services after migration: ${missing.join(", ")}`);
++
++  const method = await db.execute(sql`
++    SELECT id FROM finance_payment_methods
++    WHERE name='تسوية رصيد' AND isActive=1
++    LIMIT 1
++  `);
++  if (!(((method as any)[0] ?? []) as any[]).length) {
++    throw new Error("Balance adjustment payment method was not created");
++  }
++
++  console.log("TTCRM_FINANCE_CLIENT_BOOKING_V1_MIGRATION_OK");
++}
++
++main().catch((error) => {
++  console.error("TTCRM_FINANCE_CLIENT_BOOKING_V1_MIGRATION_FAILED", error);
++  process.exit(1);
++});
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -86,3 +86,5 @@
+     "db:dry-run:finance-mvp-v1": "tsx scripts/apply-finance-mvp-v1-migration.ts",
+     "db:migrate:finance-mvp-v1": "tsx scripts/apply-finance-mvp-v1-migration.ts --apply",
++    "db:dry-run:finance-client-booking-v1": "tsx scripts/apply-finance-client-booking-v1-migration.ts",
++    "db:migrate:finance-client-booking-v1": "tsx scripts/apply-finance-client-booking-v1-migration.ts --apply",
+     "verify:finance-mvp-v1-source": "node scripts/verify-finance-mvp-v1-source.mjs",
