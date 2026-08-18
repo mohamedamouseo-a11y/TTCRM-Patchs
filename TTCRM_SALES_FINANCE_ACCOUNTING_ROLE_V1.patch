@@ -1,0 +1,175 @@
+diff --git a/server/roleUtils.ts b/server/roleUtils.ts
+--- a/server/roleUtils.ts
++++ b/server/roleUtils.ts
+@@
+ export const APP_USER_ROLES = [
+   "Admin",
+   "SalesManager",
+   "SalesAgent",
++  "SalesFinanceAccounting",
+   "AccountManager",
+@@
+   salesagent: "SalesAgent",
+   sales_agent: "SalesAgent",
++  salesfinanceaccounting: "SalesFinanceAccounting",
++  sales_finance_accounting: "SalesFinanceAccounting",
+@@
+ export function isSalesAgentRole(role?: string | null): boolean {
+-  return normalizeUserRole(role) === "SalesAgent";
++  const normalized = normalizeUserRole(role);
++  return normalized === "SalesAgent" || normalized === "SalesFinanceAccounting";
+ }
+diff --git a/client/src/lib/roles.ts b/client/src/lib/roles.ts
+--- a/client/src/lib/roles.ts
++++ b/client/src/lib/roles.ts
+@@
+ export const APP_USER_ROLES = [
+   "Admin",
+   "SalesManager",
+   "SalesAgent",
++  "SalesFinanceAccounting",
+   "AccountManager",
+@@
+   salesagent: "SalesAgent",
+   sales_agent: "SalesAgent",
++  salesfinanceaccounting: "SalesFinanceAccounting",
++  sales_finance_accounting: "SalesFinanceAccounting",
+diff --git a/drizzle/schema.ts b/drizzle/schema.ts
+--- a/drizzle/schema.ts
++++ b/drizzle/schema.ts
+@@
+-	role: mysqlEnum(["Admin","SalesManager","SalesAgent","ServiceAdvisor","PartsAgent","CrmFollowUp","Viewer","MediaBuyer","AccountManager","AccountManagerLead","BusinessDeveloper"]).default('SalesAgent').notNull(),
++	role: mysqlEnum(["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","PartsAgent","CrmFollowUp","Viewer","MediaBuyer","AccountManager","AccountManagerLead","BusinessDeveloper"]).default('SalesAgent').notNull(),
+diff --git a/server/services/financeService.ts b/server/services/financeService.ts
+--- a/server/services/financeService.ts
++++ b/server/services/financeService.ts
+@@
+ const MONEY_MAX = new Decimal("999999999999.99");
+ const FULL_ACCESS_ROLES = new Set<FinanceRole>(["Owner", "FinanceManager", "Accountant"]);
+-const BUILTIN_SALES_ROLES = new Set(["salesmanager", "salesagent", "accountmanager", "accountmanagerlead", "businessdeveloper"]);
++const COMBINED_SALES_FINANCE_ROLE = "salesfinanceaccounting";
++const BUILTIN_SALES_ROLES = new Set(["salesmanager", "salesagent", COMBINED_SALES_FINANCE_ROLE, "accountmanager", "accountmanagerlead", "businessdeveloper"]);
+@@
+ export async function getFinanceRole(actor: FinanceActor): Promise<FinanceRole> {
+-  if (String(actor.role ?? "").toLowerCase() === "admin") return "Owner";
++  const baseRole = String(actor.role ?? "").toLowerCase();
++  if (baseRole === "admin") return "Owner";
++  // Dedicated combined role: normal Sales workspace + full Finance/Accounting workspace.
++  if (baseRole === COMBINED_SALES_FINANCE_ROLE) return "Accountant";
+   const db = requireDb(await getDb());
+@@
+-  const mappedUsers = extractRows<any>(users).map((user) => {
++  const mappedUsers = extractRows<any>(users).map((user) => {
+     const baseRole = String(user.role ?? "").toLowerCase();
+     const explicitFinanceRole = roleMap.get(Number(user.id)) as FinanceRole | undefined;
+     return {
+       ...user,
+       financeRole: baseRole === "admin"
+         ? "Owner"
+-        : (explicitFinanceRole ?? (BUILTIN_SALES_ROLES.has(baseRole) ? "Sales" : "NoAccess")),
++        : baseRole === COMBINED_SALES_FINANCE_ROLE
++          ? "Accountant"
++          : (explicitFinanceRole ?? (BUILTIN_SALES_ROLES.has(baseRole) ? "Sales" : "NoAccess")),
+       // Finance permission is additive to the user's base role.
+       isSalesUser: BUILTIN_SALES_ROLES.has(baseRole) || explicitFinanceRole === "Sales",
+     };
+diff --git a/client/src/components/CRMLayout.tsx b/client/src/components/CRMLayout.tsx
+--- a/client/src/components/CRMLayout.tsx
++++ b/client/src/components/CRMLayout.tsx
+@@
+-      roles: ["Admin", "SalesManager", "SalesAgent", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer"],
++      roles: ["Admin", "SalesManager", "SalesAgent", "SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer"],
+@@
+-      roles: ["Admin", "SalesManager", "SalesAgent", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "MediaBuyer"],
++      roles: ["Admin", "SalesManager", "SalesAgent", "SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "MediaBuyer"],
+@@
+-      roles: ["Admin", "SalesManager", "SalesAgent", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer", "AccountManager", "AccountManagerLead", "BusinessDeveloper"],
++      roles: ["Admin", "SalesManager", "SalesAgent", "SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer", "AccountManager", "AccountManagerLead", "BusinessDeveloper"],
+@@
+-      roles: ["Admin", "SalesManager", "SalesAgent", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "MediaBuyer"],
++      roles: ["Admin", "SalesManager", "SalesAgent", "SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "MediaBuyer"],
+@@
+-          const showSales = ["Admin", "SalesManager", "SalesAgent", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer"].includes(role);
++          const showSales = ["Admin", "SalesManager", "SalesAgent", "SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer"].includes(role);
+diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
+--- a/client/src/pages/AdminSettings.tsx
++++ b/client/src/pages/AdminSettings.tsx
+@@
+                   {ROLES.map((r) => (
+-                    <SelectItem key={r} value={r}>{t(r as any)}</SelectItem>
++                    <SelectItem key={r} value={r}>
++                      {r === "SalesFinanceAccounting"
++                        ? (isRTL ? "مبيعات + حسابات + مالية" : "Sales + Accounting + Finance")
++                        : t(r as any)}
++                    </SelectItem>
+                   ))}
+diff --git a/scripts/apply-sales-finance-accounting-role-v1-migration.ts b/scripts/apply-sales-finance-accounting-role-v1-migration.ts
+new file mode 100644
+--- /dev/null
++++ b/scripts/apply-sales-finance-accounting-role-v1-migration.ts
+@@
++import "dotenv/config";
++import { sql } from "drizzle-orm";
++import { getDb } from "../server/db";
++
++const APPLY = process.argv.includes("--apply");
++
++async function main() {
++  const db = await getDb();
++  if (!db) throw new Error("DATABASE_URL is not configured or database is unavailable");
++
++  if (!APPLY) {
++    console.log("DRY_RUN sales_finance_accounting_role_v1");
++    console.log("Would add users.role = SalesFinanceAccounting.");
++    console.log("This role will have Sales Agent behavior plus Finance & Accounting access.");
++    console.log("Re-run with --apply to execute.");
++    return;
++  }
++
++  await db.execute(sql.raw(`
++    ALTER TABLE users
++    MODIFY role ENUM(
++      'Admin',
++      'SalesManager',
++      'SalesAgent',
++      'SalesFinanceAccounting',
++      'ServiceAdvisor',
++      'PartsAgent',
++      'CrmFollowUp',
++      'Viewer',
++      'MediaBuyer',
++      'AccountManager',
++      'AccountManagerLead',
++      'BusinessDeveloper'
++    ) NOT NULL DEFAULT 'SalesAgent'
++  `));
++
++  const column = await db.execute(sql`
++    SELECT column_type AS columnType
++    FROM information_schema.columns
++    WHERE table_schema = DATABASE()
++      AND table_name = 'users'
++      AND column_name = 'role'
++    LIMIT 1
++  `);
++  const row = (((column as any)[0] ?? []) as any[])[0];
++  if (!String(row?.columnType ?? "").includes("SalesFinanceAccounting")) {
++    throw new Error("users.role does not contain SalesFinanceAccounting after migration");
++  }
++
++  console.log("TTCRM_SALES_FINANCE_ACCOUNTING_ROLE_V1_MIGRATION_OK");
++}
++
++main().catch((error) => {
++  console.error("TTCRM_SALES_FINANCE_ACCOUNTING_ROLE_V1_MIGRATION_FAILED", error);
++  process.exit(1);
++});
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@
+     "db:dry-run:finance-client-booking-v1": "tsx scripts/apply-finance-client-booking-v1-migration.ts",
+     "db:migrate:finance-client-booking-v1": "tsx scripts/apply-finance-client-booking-v1-migration.ts --apply",
++    "db:dry-run:sales-finance-accounting-role-v1": "tsx scripts/apply-sales-finance-accounting-role-v1-migration.ts",
++    "db:migrate:sales-finance-accounting-role-v1": "tsx scripts/apply-sales-finance-accounting-role-v1-migration.ts --apply",
+     "verify:finance-mvp-v1-source": "node scripts/verify-finance-mvp-v1-source.mjs",
