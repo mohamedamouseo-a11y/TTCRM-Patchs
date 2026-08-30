@@ -1,0 +1,39 @@
+diff --git a/server/services/developerHubGitHubSecurity.ts b/server/services/developerHubGitHubSecurity.ts
+index 1111111..2222222 100644
+--- a/server/services/developerHubGitHubSecurity.ts
++++ b/server/services/developerHubGitHubSecurity.ts
+@@ -23,6 +23,8 @@ const BLOCKED_PREFIXES = [
+   "tmp/", "temp/", "logs/", ".ssh/", ".aws/", ".config/",
+ ];
+ 
++const SAFE_SQL_MIGRATION_PREFIX = "drizzle/migrations/";
++
+ const SECRET_PATTERNS: Array<{ label: string; expression: RegExp }> = [
+@@ -67,12 +69,14 @@ export function getBlockedGitPathReason(filePath: string) {
+   const normalized = normalizeGitPath(filePath);
+   const lower = normalized.toLowerCase();
+   const base = path.posix.basename(lower);
++  const isSafeTextSqlMigration = lower.startsWith(SAFE_SQL_MIGRATION_PREFIX) && base.endsWith(".sql");
+   if (!normalized || normalized.includes("\0") || normalized.startsWith("../") || normalized.includes("/../")) return "Unsafe repository path";
+   if (BLOCKED_PREFIXES.some((prefix) => lower === prefix.slice(0, -1) || lower.startsWith(prefix))) return "Runtime or private directory";
+   if (BLOCKED_BASENAMES.has(base)) return "Sensitive file name";
+   if (base.startsWith(".env.") && !base.endsWith(".example")) return "Environment secret file";
+   if (base.endsWith(".env") && !base.endsWith(".example.env")) return "Environment secret file";
+-  if (BLOCKED_EXTENSIONS.some((extension) => base.endsWith(extension))) return "Sensitive or binary archive";
++  if (!isSafeTextSqlMigration && BLOCKED_EXTENSIONS.some((extension) => base.endsWith(extension))) return "Sensitive or binary archive";
+   if (/private[-_]?key|client[-_]?secret|access[-_]?token|service[-_]?account/i.test(base)) return "Secret-looking file name";
+   return null;
+ }
+diff --git a/server/services/developerHubGitHubSecurity.test.ts b/server/services/developerHubGitHubSecurity.test.ts
+index 3333333..4444444 100644
+--- a/server/services/developerHubGitHubSecurity.test.ts
++++ b/server/services/developerHubGitHubSecurity.test.ts
+@@ -29,6 +29,8 @@ describe("Developer Hub GitHub security", () => {
+     expect(getBlockedGitPathReason(".env")).toBeTruthy();
+     expect(getBlockedGitPathReason("storage/developer-hub.json")).toBeTruthy();
+     expect(getBlockedGitPathReason("backup.sql")).toBeTruthy();
++    expect(getBlockedGitPathReason("migrations/manual.sql")).toBeTruthy();
++    expect(getBlockedGitPathReason("drizzle/migrations/20260829_darwish_ai_provider_phase2_routing_fallback.sql")).toBeNull();
+     expect(getBlockedGitPathReason("release.zip")).toBeTruthy();
+     expect(getBlockedGitPathReason("client/src/App.tsx")).toBeNull();
+     expect(getBlockedGitObjectModeReason("120000")).toContain("Symbolic");
