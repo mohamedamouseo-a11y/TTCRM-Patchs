@@ -1,0 +1,191 @@
+From e56bf56b1cc84517fcf2f165750bdce8d6e7c230 Mon Sep 17 00:00:00 2001
+From: mohamedamouseo-a11y <mohamedamou.seo@gmail.com>
+Date: Sun, 30 Aug 2026 15:31:28 +0300
+Subject: [PATCH 1/8] feat(rbac): add dynamic role permission service
+
+---
+ server/services/rolePermissionsService.ts | 157 ++++++++++++++++++++++
+ 1 file changed, 157 insertions(+)
+ create mode 100644 server/services/rolePermissionsService.ts
+
+diff --git a/server/services/rolePermissionsService.ts b/server/services/rolePermissionsService.ts
+new file mode 100644
+index 0000000..cd2ffe2
+--- /dev/null
++++ b/server/services/rolePermissionsService.ts
+@@ -0,0 +1,157 @@
++import { sql } from "drizzle-orm";
++import { getDb } from "../db";
++import {
++  APP_PERMISSIONS,
++  APP_USER_ROLES,
++  ROLE_PERMISSIONS,
++  normalizeUserRole,
++  type AppPermission,
++  type AppUserRole,
++} from "../../shared/permissions";
++
++let ensured = false;
++const cache = new Map<AppUserRole, { permissions: readonly AppPermission[]; expiresAt: number }>();
++const CACHE_TTL_MS = 15_000;
++
++async function ensureTables() {
++  if (ensured) return;
++  const db = await getDb();
++  if (!db) return;
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS role_permission_profiles (
++      role VARCHAR(64) NOT NULL,
++      updated_by INT NULL,
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++      PRIMARY KEY (role)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
++  `));
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS role_permissions (
++      id INT NOT NULL AUTO_INCREMENT,
++      role VARCHAR(64) NOT NULL,
++      permission VARCHAR(128) NOT NULL,
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++      PRIMARY KEY (id),
++      UNIQUE KEY uq_role_permission (role, permission),
++      KEY idx_role_permissions_role (role)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
++  `));
++
++  ensured = true;
++}
++
++function asRole(role?: string | null): AppUserRole | null {
++  const normalized = normalizeUserRole(role);
++  return APP_USER_ROLES.includes(normalized as AppUserRole) ? (normalized as AppUserRole) : null;
++}
++
++function cleanPermissions(permissions: readonly string[]): AppPermission[] {
++  const allowed = new Set<string>(APP_PERMISSIONS);
++  return Array.from(new Set(permissions.filter((permission) => allowed.has(permission)))) as AppPermission[];
++}
++
++export async function getEffectiveRolePermissions(role?: string | null): Promise<readonly AppPermission[]> {
++  const normalized = asRole(role);
++  if (!normalized) return [];
++  if (normalized === "Admin") return ROLE_PERMISSIONS.Admin;
++
++  const cached = cache.get(normalized);
++  if (cached && cached.expiresAt > Date.now()) return cached.permissions;
++
++  const fallback = ROLE_PERMISSIONS[normalized] ?? [];
++  const db = await getDb();
++  if (!db) return fallback;
++
++  try {
++    await ensureTables();
++
++    const profileResult = await db.execute(sql`
++      SELECT role FROM role_permission_profiles WHERE role = ${normalized} LIMIT 1
++    `);
++    const profileRows = ((profileResult as any)[0] ?? []) as any[];
++
++    let permissions: readonly AppPermission[];
++    if (!profileRows.length) {
++      permissions = fallback;
++    } else {
++      const rowsResult = await db.execute(sql`
++        SELECT permission FROM role_permissions WHERE role = ${normalized} ORDER BY permission ASC
++      `);
++      const rows = ((rowsResult as any)[0] ?? []) as any[];
++      permissions = cleanPermissions(rows.map((row) => String(row.permission)));
++    }
++
++    cache.set(normalized, { permissions, expiresAt: Date.now() + CACHE_TTL_MS });
++    return permissions;
++  } catch (error) {
++    console.warn("[RBAC] Dynamic permissions unavailable; using static fallback", error);
++    cache.set(normalized, { permissions: fallback, expiresAt: Date.now() + CACHE_TTL_MS });
++    return fallback;
++  }
++}
++
++export async function hasEffectiveRolePermission(role: string | null | undefined, permission: AppPermission) {
++  const permissions = await getEffectiveRolePermissions(role);
++  return permissions.includes(permission);
++}
++
++export async function setEffectiveRolePermissions(role: AppUserRole, permissions: readonly AppPermission[], updatedBy?: number | null) {
++  if (role === "Admin") {
++    throw new Error("Admin permissions are locked to full access");
++  }
++
++  const db = await getDb();
++  if (!db) throw new Error("Database is unavailable");
++  await ensureTables();
++
++  const cleaned = cleanPermissions(permissions);
++  await db.transaction(async (tx) => {
++    await tx.execute(sql`
++      INSERT INTO role_permission_profiles (role, updated_by)
++      VALUES (${role}, ${updatedBy ?? null})
++      ON DUPLICATE KEY UPDATE updated_by = VALUES(updated_by), updated_at = CURRENT_TIMESTAMP
++    `);
++    await tx.execute(sql`DELETE FROM role_permissions WHERE role = ${role}`);
++    for (const permission of cleaned) {
++      await tx.execute(sql`
++        INSERT INTO role_permissions (role, permission) VALUES (${role}, ${permission})
++      `);
++    }
++  });
++
++  cache.delete(role);
++  return getEffectiveRolePermissions(role);
++}
++
++export async function resetEffectiveRolePermissions(role: AppUserRole) {
++  if (role === "Admin") return ROLE_PERMISSIONS.Admin;
++  const db = await getDb();
++  if (!db) throw new Error("Database is unavailable");
++  await ensureTables();
++  await db.transaction(async (tx) => {
++    await tx.execute(sql`DELETE FROM role_permissions WHERE role = ${role}`);
++    await tx.execute(sql`DELETE FROM role_permission_profiles WHERE role = ${role}`);
++  });
++  cache.delete(role);
++  return ROLE_PERMISSIONS[role] ?? [];
++}
++
++export async function getRolePermissionMatrix() {
++  const db = await getDb();
++  const customized = new Set<string>();
++
++  if (db) {
++    await ensureTables();
++    const profileResult = await db.execute(sql`SELECT role FROM role_permission_profiles`);
++    const rows = ((profileResult as any)[0] ?? []) as any[];
++    rows.forEach((row) => customized.add(String(row.role)));
++  }
++
++  const entries = await Promise.all(APP_USER_ROLES.map(async (role) => ({
++    role,
++    permissions: [...await getEffectiveRolePermissions(role)],
++    customized: role !== "Admin" && customized.has(role),
++    locked: role === "Admin",
++  })));
++
++  return {
++    roles: entries,
++    allPermissions: [...APP_PERMISSIONS],
++  };
++}
++
++// Additional patch changes:
++// - add scripts/apply-dynamic-rbac-role-permissions-v1.ts migration
++// - expose myPermissions/rolePermissions/updateRolePermissions/resetRolePermissions in server/_core/systemRouter.ts
++// - make client/src/lib/roles.ts support runtime overrides
++// - hydrate permissions in client/src/_core/hooks/useAuth.ts
++// - make client/src/components/RolePermissionsStudio.tsx editable with module visibility + CRUD/manage/approve/action toggles
++// - enforce dynamic permissions in server/_core/trpc.ts
++
++// Full source of the remaining changes is available in TTCRM PR #2 history/branch feature/dynamic-rbac-role-permissions.
