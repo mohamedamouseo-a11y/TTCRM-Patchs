@@ -1,0 +1,645 @@
+# TTCRM_DYNAMIC_RBAC_FULL_CONTROL_V2
+# Base: TTCRM master ceef81e76f2c6a3b8e6bf6494da8d265874bed23
+# Prerequisite: apply/cherry-pick feature/dynamic-rbac-role-permissions first.
+# This V2 removes legacy role-name blockers so dynamic grants/denials are authoritative.
+# Do NOT apply directly to master; use feature/dynamic-rbac-full-control-v2.
+
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -94,7 +94,7 @@ function Router() {
+     <>
+     <GlobalSearch />
+     <Switch>
+-      <Route path="/" component={AgentDashboard} />
++      <PermissionRoute path="/" permission="dashboard.view" component={AgentDashboard} />
+       <Route path="/login" component={Login} />
+       <PermissionRoute path="/dashboard" permission="dashboard.view" component={AgentDashboard} />
+       <PermissionRoute path="/finance" permission="finance.view" component={FinanceDashboard} />
+@@ -126,7 +126,7 @@ function Router() {
+       <PermissionRoute path="/team-dashboard" permission="sales.reports" component={TeamDashboard} />
+       <PermissionRoute path="/sales-reports" permission="sales.reports" component={SalesReports} />
+       <PermissionRoute path="/sales-funnel" permission="sales.view" component={SalesFunnelDashboard} />
+-      <PermissionRoute path="/lead-distribution" permission="sales.view" component={LeadDistributionPage} />
++      <PermissionRoute path="/lead-distribution" permission="sales.assign" component={LeadDistributionPage} />
+       <PermissionRoute path="/task-sla" permission="sales.view" component={TaskSlaDashboard} />
+       <PermissionRoute path="/leads" permission="sales.view" component={LeadsList} />
+       <PermissionRoute path="/leads/:id" permission="sales.view" component={LeadProfile} />
+@@ -157,9 +157,9 @@ function Router() {
+       <Route path="/ar/help-center/:slug" component={HelpCenter} />
+       <Route path="/en/help-center" component={HelpCenter} />
+       <Route path="/en/help-center/:slug" component={HelpCenter} />
+-      <Route path="/support-center" component={SupportCenter} />
++      <PermissionRoute path="/support-center" permission="support.view" component={SupportCenter} />
+       <PermissionRoute path="/support-center/admin" permission="support.manage" component={SupportAdminInbox} />
+-      <Route path="/support-center/:id" component={SupportRequestDetail} />
++      <PermissionRoute path="/support-center/:id" permission="support.view" component={SupportRequestDetail} />
+       <PermissionRoute path="/wa-gateway/accounts" permission="whatsapp.manage" component={WAGatewayAccounts} />
+       <PermissionRoute path="/wa-gateway/settings" permission="whatsapp.manage" component={WAGatewaySettings} />
+       <PermissionRoute path="/wa-gateway/tara" permission="whatsapp.view" component={WaAiAgentPage} />
+
+diff --git a/client/src/components/CRMLayout.tsx b/client/src/components/CRMLayout.tsx
+--- a/client/src/components/CRMLayout.tsx
++++ b/client/src/components/CRMLayout.tsx
+@@ -63,6 +63,7 @@ interface NavItem {
+   href: string;
+   labelKey: string;
+   icon: React.ReactNode;
++  permission?: AppPermission;
+   roles?: string[];
+   badge?: number;
+   visible?: boolean;
+@@ -246,27 +247,30 @@ export default function CRMLayout({ children, title: _title }: { children: React
+     },
+     {
+       href: "/bd",
++      permission: "businessDevelopment.view",
+       labelKey: "bd",
+       icon: <BarChart3 size={18} />,
+-      visible: hasBdAccess || ["Admin", "SalesManager"].includes(role),
++      visible: true,
+     },
+     {
+       href: "/bd/analytics",
++      permission: "businessDevelopment.view",
+       labelKey: "bdAnalyticsNav",
+       icon: <BarChart3 size={18} />,
+-      visible: hasBdAccess || ["Admin", "SalesManager"].includes(role),
++      visible: true,
+     },
+     {
+       href: "/bd/coaching",
++      permission: "businessDevelopment.view",
+       labelKey: "bdCoachingNav",
+       icon: <Users size={18} />,
+-      visible: ["Admin", "SalesManager"].includes(role),
++      visible: true,
+     },
+@@ -275,25 +279,25 @@ export default function CRMLayout({ children, title: _title }: { children: React
+     },
+     {
+       href: "/support-center",
++      permission: "support.view",
+       labelKey: "supportCenter",
+       icon: <LifeBuoy size={18} />,
+     },
+     {
+       href: "/support-center/admin",
++      permission: "support.manage",
+       labelKey: "supportAdmin",
+       icon: <Inbox size={18} />,
+-      visible: String(user?.email ?? "").toLowerCase() === "admin@tamiyouz.com",
+     },
+   ];
+ 
+-  const isBdOnly = role === "BusinessDeveloper";
+-  const BD_ALLOWED_HREFS = ["/finance", "/bd", "/bd/deals", "/bd/companies", "/bd/contacts", "/bd/analytics", "/bd/templates", "/bd/coaching", "/bd/settings", "/support-center", "/notification-settings"];
+   const visibleNavItems = navItems.filter((item) => {
+     if (!(item.visible ?? true)) return false;
+-    if (isBdOnly) return BD_ALLOWED_HREFS.includes(item.href);
+-    return (!item.roles || item.roles.includes(role)) && (!item.permission || hasRolePermission(user?.role, item.permission));
++    if (item.permission) return hasRolePermission(user?.role, item.permission);
++    return !item.roles || item.roles.includes(role);
+   });
+@@ -329,16 +333,16 @@ export default function CRMLayout({ children, title: _title }: { children: React
+           const isSalesActive = salesHrefs.some(h => location === h || location.startsWith(h + "/"));
+           const waGatewayHrefs = ["/wa-gateway", "/wa-gateway/tara", "/wa-gateway/accounts"];
+           const isWaGatewayActive = waGatewayHrefs.some(h => location === h || location.startsWith(h + "/"));
+-          const showWaGateway = role !== "Viewer";
++          const showWaGateway = hasRolePermission(user?.role, "whatsapp.view");
+           const showMarketing = hasRolePermission(user?.role, "marketing.view");
+-          const showFinance = financeAccess.isSuccess;
+-          const showSales = ["Admin", "SalesManager", "SalesAgent","SalesFinanceAccounting", "ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "MediaBuyer"].includes(role);
++          const showFinance = hasRolePermission(user?.role, "finance.view") && financeAccess.isSuccess;
++          const showSales = hasRolePermission(user?.role, "sales.view");
+ 
+           const amHrefs = ["/am-dashboard", "/am-calendar", "/clients", "/renewals", "/workflow-dashboard", "/operations-dashboard", "/tam-dashboard", "/am-lead-dashboard"];
+           const bdHrefs = ["/bd", "/bd/analytics", "/bd/coaching", "/bd/deals", "/bd/companies", "/bd/contacts", "/bd/settings", "/email-marketing"];
+           const isAmActive = amHrefs.some(h => location === h || location.startsWith(h + "/"));
+-          const showAm = ["Admin", "SalesManager", "AccountManager", "AccountManagerLead", "ServiceAdvisor", "PartsAgent", "CrmFollowUp"].includes(role);
++          const showAm = hasRolePermission(user?.role, "accounts.view");
+           const isBdGroupActive = bdHrefs.some(h => location === h || location.startsWith(h + "/"));
+-          const showBdGroup = hasBdAccess || ["Admin", "SalesManager"].includes(role);
++          const showBdGroup = hasRolePermission(user?.role, "businessDevelopment.view");
+@@ -417,10 +421,10 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {(waGatewayOpen || isWaGatewayActive) && sidebarOpen && (
+                     <div className="mt-0.5 space-y-0.5 overflow-hidden" style={{ animation: "slideDown 0.18s ease-out" }}>
+                       {[
+-                        { href: "/wa-gateway", label: isRTL ? "المحادثات" : "Inbox", icon: <MessageCircle size={15} />, roles: ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","PartsAgent","CrmFollowUp","MediaBuyer","AccountManager","AccountManagerLead","BusinessDeveloper"], visible: true },
+-                        { href: "/wa-gateway/tara", label: "Tara", icon: <Sparkles size={15} />, roles: ["Admin","SalesManager","SalesAgent"], visible: true },
+-                        { href: "/wa-gateway/accounts", label: isRTL ? "الحسابات و QR" : "Accounts & QR", icon: <QrCode size={15} />, roles: ["Admin"], visible: true },
+-                      ].filter(sub => sub.visible && sub.roles.includes(role)).map(sub => {
++                        { href: "/wa-gateway", label: isRTL ? "المحادثات" : "Inbox", icon: <MessageCircle size={15} />, permission: "whatsapp.view" as AppPermission, visible: true },
++                        { href: "/wa-gateway/tara", label: "Tara", icon: <Sparkles size={15} />, permission: "whatsapp.view" as AppPermission, visible: true },
++                        { href: "/wa-gateway/accounts", label: isRTL ? "الحسابات و QR" : "Accounts & QR", icon: <QrCode size={15} />, permission: "whatsapp.manage" as AppPermission, visible: true },
++                      ].filter(sub => sub.visible && hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -451,10 +455,10 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {!sidebarOpen && (waGatewayOpen || isWaGatewayActive) && (
+                     <div className="mt-0.5 space-y-0.5">
+                       {[
+-                        { href: "/wa-gateway", icon: <MessageCircle size={15} />, roles: ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","PartsAgent","CrmFollowUp","MediaBuyer","AccountManager","AccountManagerLead","BusinessDeveloper"], visible: true },
+-                        { href: "/wa-gateway/tara", icon: <Sparkles size={15} />, roles: ["Admin","SalesManager","SalesAgent"], visible: true },
+-                        { href: "/wa-gateway/accounts", icon: <QrCode size={15} />, roles: ["Admin"], visible: true },
+-                      ].filter(sub => sub.visible && sub.roles.includes(role)).map(sub => {
++                        { href: "/wa-gateway", icon: <MessageCircle size={15} />, permission: "whatsapp.view" as AppPermission, visible: true },
++                        { href: "/wa-gateway/tara", icon: <Sparkles size={15} />, permission: "whatsapp.view" as AppPermission, visible: true },
++                        { href: "/wa-gateway/accounts", icon: <QrCode size={15} />, permission: "whatsapp.manage" as AppPermission, visible: true },
++                      ].filter(sub => sub.visible && hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -515,23 +519,16 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                     <div className="mt-0.5 space-y-0.5 overflow-hidden" style={{ animation: "slideDown 0.18s ease-out" }}>
+                       {[
+-                        { href: "/team-dashboard",
+-      permission: "sales.reports", label: isRTL ? "لوحة الفريق" : "Team Dashboard", icon: <BarChart3 size={15} /> },
+-                        { href: "/sales-reports", label: isRTL ? "تقارير المبيعات" : "Sales Reports", icon: <FileSpreadsheet size={15} /> },
+-                        { href: "/leads", label: isRTL ? "العملاء المحتملون" : "Leads", icon: <Users size={15} />, badge: leadsSlaBadge },
+-                        { href: "/lead-distribution", label: isRTL ? "توزيع العملاء المحتملون" : "Lead Distribution", icon: <UsersRound size={15} /> },
+-                        { href: "/sales-funnel", label: isRTL ? "قمع المبيعات" : "Sales Funnel", icon: <Filter size={15} /> },
+-                        { href: "/task-sla", label: isRTL ? "مهام SLA" : "Task SLA", icon: <ClipboardList size={15} /> },
+-                        { href: "/calendar", label: isRTL ? "التقويم" : "Calendar", icon: <Calendar size={15} /> },
+-                        { href: "/sales/wa", label: isRTL ? "واتساب السفر" : "Travel WhatsApp", icon: <MessageCircle size={15} /> },
+-                      ].filter(sub => {
+-                        if (sub.href === "/team-dashboard" || sub.href === "/sales-reports") return ["Admin","SalesManager","Viewer"].includes(role);
+-                        if (sub.href === "/leads") return ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","PartsAgent","CrmFollowUp","Viewer","MediaBuyer"].includes(role);
+-                        if (sub.href === "/lead-distribution") return role === "Admin";
+-                        if (sub.href === "/sales-funnel") return ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","Viewer"].includes(role);
+-                        if (sub.href === "/task-sla") return ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","Viewer"].includes(role);
+-                        if (sub.href === "/calendar") return ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","CrmFollowUp","MediaBuyer"].includes(role);
+-                        if (sub.href === "/sales/wa") return ["Admin","SalesManager","SalesAgent","SalesFinanceAccounting","ServiceAdvisor","PartsAgent","CrmFollowUp","Viewer"].includes(role);
+-                        return true;
+-                      }).map(sub => {
++                        { href: "/team-dashboard", permission: "sales.reports" as AppPermission, label: isRTL ? "لوحة الفريق" : "Team Dashboard", icon: <BarChart3 size={15} /> },
++                        { href: "/sales-reports", permission: "sales.reports" as AppPermission, label: isRTL ? "تقارير المبيعات" : "Sales Reports", icon: <FileSpreadsheet size={15} /> },
++                        { href: "/leads", permission: "sales.view" as AppPermission, label: isRTL ? "العملاء المحتملون" : "Leads", icon: <Users size={15} />, badge: leadsSlaBadge },
++                        { href: "/lead-distribution", permission: "sales.assign" as AppPermission, label: isRTL ? "توزيع العملاء المحتملون" : "Lead Distribution", icon: <UsersRound size={15} /> },
++                        { href: "/sales-funnel", permission: "sales.view" as AppPermission, label: isRTL ? "قمع المبيعات" : "Sales Funnel", icon: <Filter size={15} /> },
++                        { href: "/task-sla", permission: "sales.view" as AppPermission, label: isRTL ? "مهام SLA" : "Task SLA", icon: <ClipboardList size={15} /> },
++                        { href: "/calendar", permission: "sales.view" as AppPermission, label: isRTL ? "التقويم" : "Calendar", icon: <Calendar size={15} /> },
++                        { href: "/sales/wa", permission: "whatsapp.view" as AppPermission, label: isRTL ? "واتساب السفر" : "Travel WhatsApp", icon: <MessageCircle size={15} /> },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -558,9 +555,16 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {!sidebarOpen && (salesOpen || isSalesActive) && (
+                     <div className="mt-0.5 space-y-0.5">
+-                      {["/leads", "/sales-funnel", "/task-sla", "/calendar", "/sales/wa"].map((href, i) => {
+-                        const icons = [<Users size={15} />, <Filter size={15} />, <ClipboardList size={15} />, <Calendar size={15} />, <MessageCircle size={15} />];
+-                        const subActive = location === href || location.startsWith(href + "/");
++                      {[
++                        { href: "/leads", permission: "sales.view" as AppPermission, icon: <Users size={15} /> },
++                        { href: "/sales-funnel", permission: "sales.view" as AppPermission, icon: <Filter size={15} /> },
++                        { href: "/task-sla", permission: "sales.view" as AppPermission, icon: <ClipboardList size={15} /> },
++                        { href: "/calendar", permission: "sales.view" as AppPermission, icon: <Calendar size={15} /> },
++                        { href: "/sales/wa", permission: "whatsapp.view" as AppPermission, icon: <MessageCircle size={15} /> },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map((sub) => {
++                        const href = sub.href;
++                        const subActive = location === href || location.startsWith(href + "/");
+                         return (
+                           <Link key={href} href={href}>
+@@ -570,7 +574,7 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                               style={subActive ? { background: `linear-gradient(135deg, ${tokens.primaryColor}, color-mix(in srgb, ${tokens.primaryColor} 75%, ${tokens.accentColor}))` } : {}}
+                               onClick={() => setMobileOpen(false)}
+-                            >{icons[i]}</div>
++                            >{sub.icon}</div>
+                           </Link>
+                         );
+                       })}
+@@ -700,15 +704,15 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {(amOpen || isAmActive) && sidebarOpen && (
+                     <div className="mt-0.5 space-y-0.5 overflow-hidden" style={{ animation: "slideDown 0.18s ease-out" }}>
+                       {[
+-                        { href: "/am-dashboard",        label: isRTL ? "لوحة AM" : "AM Dashboard",       icon: <Zap size={15} />,          roles: ["Admin","AccountManager","AccountManagerLead"] },
+-                        { href: "/am-calendar",         label: isRTL ? "تقويم AM" : "AM Calendar",        icon: <Calendar size={15} />,      roles: ["Admin","AccountManager","AccountManagerLead"] },
+-                        { href: "/clients",             label: isRTL ? "العملاء" : "Client Pool",          icon: <Briefcase size={15} />,     roles: ["Admin","SalesManager","AccountManager","AccountManagerLead","ServiceAdvisor","PartsAgent","CrmFollowUp"] },
+-                        { href: "/renewals",            label: isRTL ? "التجديدات" : "Renewals",           icon: <Activity size={15} />,      roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/workflow-dashboard",  label: isRTL ? "Workflow" : "Workflow",            icon: <ClipboardList size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/operations-dashboard",label: isRTL ? "لوحة العمليات" : "Operations",    icon: <ClipboardList size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/am-lead-dashboard",   label: isRTL ? "أداء الفريق" : "Team Performance", icon: <BarChart3 size={15} />,     roles: ["Admin","AccountManagerLead"] },
+-                      ].filter(sub => sub.roles.includes(role)).map(sub => {
++                        { href: "/am-dashboard",        label: isRTL ? "لوحة AM" : "AM Dashboard",       icon: <Zap size={15} />,          permission: "accounts.view" as AppPermission },
++                        { href: "/am-calendar",         label: isRTL ? "تقويم AM" : "AM Calendar",        icon: <Calendar size={15} />,      permission: "accounts.view" as AppPermission },
++                        { href: "/clients",             label: isRTL ? "العملاء" : "Client Pool",          icon: <Briefcase size={15} />,     permission: "accounts.view" as AppPermission },
++                        { href: "/renewals",            label: isRTL ? "التجديدات" : "Renewals",           icon: <Activity size={15} />,      permission: "accounts.view" as AppPermission },
++                        { href: "/workflow-dashboard",  label: isRTL ? "Workflow" : "Workflow",            icon: <ClipboardList size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/operations-dashboard",label: isRTL ? "لوحة العمليات" : "Operations",    icon: <ClipboardList size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/am-lead-dashboard",   label: isRTL ? "أداء الفريق" : "Team Performance", icon: <BarChart3 size={15} />,     permission: "accounts.view" as AppPermission },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -738,15 +742,15 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {!sidebarOpen && (amOpen || isAmActive) && (
+                     <div className="mt-0.5 space-y-0.5">
+                       {[
+-                        { href: "/am-dashboard", icon: <Zap size={15} />, roles: ["Admin","AccountManager","AccountManagerLead"] },
+-                        { href: "/am-calendar", icon: <Calendar size={15} />, roles: ["Admin","AccountManager","AccountManagerLead"] },
+-                        { href: "/clients", icon: <Briefcase size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead","ServiceAdvisor","PartsAgent","CrmFollowUp"] },
+-                        { href: "/renewals", icon: <Activity size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/workflow-dashboard", icon: <ClipboardList size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/operations-dashboard", icon: <ClipboardList size={15} />, roles: ["Admin","SalesManager","AccountManager","AccountManagerLead"] },
+-                        { href: "/am-lead-dashboard", icon: <BarChart3 size={15} />, roles: ["Admin","AccountManagerLead"] },
+-                      ].filter(sub => sub.roles.includes(role)).map(sub => {
++                        { href: "/am-dashboard", icon: <Zap size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/am-calendar", icon: <Calendar size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/clients", icon: <Briefcase size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/renewals", icon: <Activity size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/workflow-dashboard", icon: <ClipboardList size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/operations-dashboard", icon: <ClipboardList size={15} />, permission: "accounts.view" as AppPermission },
++                        { href: "/am-lead-dashboard", icon: <BarChart3 size={15} />, permission: "accounts.view" as AppPermission },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -856,10 +860,10 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {(bdOpen || isBdGroupActive) && sidebarOpen && (
+                     <div className="mt-0.5 space-y-0.5 overflow-hidden" style={{ animation: "slideDown 0.18s ease-out" }}>
+                       {[
+-                        { href: "/bd",           label: isRTL ? "لوحة تحكم BD" : "BD Dashboard",  icon: <BarChart3 size={15} /> },
+-                        { href: "/bd/analytics", label: isRTL ? "تحليلات الأعمال" : "BD Analytics", icon: <BarChart3 size={15} /> },
+-                        { href: "/email-marketing", label: isRTL ? "تسويق إلكتروني" : "Email Marketing", icon: <Send size={15} /> },
+-                        { href: "/bd/coaching",  label: isRTL ? "التدريب" : "Coaching",             icon: <Users size={15} />,    roles: ["Admin","SalesManager"] },
+-                      ].filter(sub => !sub.roles || sub.roles.includes(role)).map(sub => {
++                        { href: "/bd",           label: isRTL ? "لوحة تحكم BD" : "BD Dashboard",  icon: <BarChart3 size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                        { href: "/bd/analytics", label: isRTL ? "تحليلات الأعمال" : "BD Analytics", icon: <BarChart3 size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                        { href: "/email-marketing", label: isRTL ? "تسويق إلكتروني" : "Email Marketing", icon: <Send size={15} />, permission: "emailMarketing.view" as AppPermission },
++                        { href: "/bd/coaching",  label: isRTL ? "التدريب" : "Coaching",             icon: <Users size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map(sub => {
+@@ -889,10 +893,10 @@ export default function CRMLayout({ children, title: _title }: { children: React
+                   {!sidebarOpen && (bdOpen || isBdGroupActive) && (
+                     <div className="mt-0.5 space-y-0.5">
+                       {[
+-                        { href: "/bd",           icon: <BarChart3 size={15} /> },
+-                        { href: "/bd/analytics", icon: <BarChart3 size={15} /> },
+-                        { href: "/email-marketing", icon: <Send size={15} /> },
+-                        { href: "/bd/coaching",  icon: <Users size={15} />, roles: ["Admin","SalesManager"] },
+-                      ].filter(sub => !sub.roles || sub.roles.includes(role)).map(sub => {
++                        { href: "/bd",           icon: <BarChart3 size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                        { href: "/bd/analytics", icon: <BarChart3 size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                        { href: "/email-marketing", icon: <Send size={15} />, permission: "emailMarketing.view" as AppPermission },
++                        { href: "/bd/coaching",  icon: <Users size={15} />, permission: "businessDevelopment.view" as AppPermission },
++                      ].filter(sub => hasRolePermission(user?.role, sub.permission)).map(sub => {
+
+diff --git a/server/services/rolePermissionsService.ts b/server/services/rolePermissionsService.ts
+--- a/server/services/rolePermissionsService.ts
++++ b/server/services/rolePermissionsService.ts
+@@ -157,3 +157,97 @@ export async function getRolePermissionMatrix() {
+     allPermissions: [...APP_PERMISSIONS],
+   };
+ }
++
++type ProcedureType = "query" | "mutation" | "subscription";
++
++function hasAction(path: string, actions: readonly string[]) {
++  const normalized = path.toLowerCase();
++  return actions.some((action) => normalized.includes(action.toLowerCase()));
++}
++
++/**
++ * Coarse RBAC gate for old protectedProcedure endpoints.
++ * More specific permissionProcedure guards still run afterwards.
++ */
++export function getRequiredPermissionForProcedure(path: string, type: ProcedureType): AppPermission | null {
++  const root = String(path || "").split(".")[0];
++  const isMutation = type === "mutation";
++
++  if (root === "salesReports") return "sales.reports";
++  if (root === "leadDistribution") return isMutation ? "sales.assign" : "sales.view";
++
++  if (["leads", "activities", "deals", "campaigns", "pipelineStages", "customFields", "sales", "calendar"].includes(root)) {
++    if (!isMutation) return "sales.view";
++    if (hasAction(path, ["delete", "remove", "permanentdelete"])) return "sales.delete";
++    if (hasAction(path, ["assign", "transfer", "distribution", "handover"])) return "sales.assign";
++    if (hasAction(path, ["create", "add", "bulkcreate", "import"])) return "sales.create";
++    return "sales.edit";
++  }
++
++  if (["accountManagement", "dynamicWorkflow", "renewals"].includes(root)) {
++    if (!isMutation) return "accounts.view";
++    if (hasAction(path, ["delete", "remove"])) return "accounts.delete";
++    if (hasAction(path, ["create", "add"])) return "accounts.create";
++    if (hasAction(path, ["assign", "handover", "workflow", "manage"])) return "accounts.manage";
++    return "accounts.edit";
++  }
++
++  if (root === "finance") {
++    if (!isMutation) return "finance.view";
++    if (hasAction(path, ["setting", "config"])) return "finance.settings";
++    if (hasAction(path, ["approve", "approval"])) return "finance.approve";
++    return "finance.edit";
++  }
++
++  if (root === "inbox" || root === "inAppNotifications") return "inbox.view";
++  if (["chat", "messenger"].includes(root)) return isMutation ? "chat.reply" : "chat.view";
++
++  if (["aiSocialAgent", "meta", "metaAds", "metaCampaigns", "tiktok", "googleAds", "snapchat", "linkedin"].includes(root)) {
++    return isMutation ? "marketing.manage" : "marketing.view";
++  }
++
++  if (root === "emailMarketing") return isMutation ? "emailMarketing.manage" : "emailMarketing.view";
++
++  if (["waGateway", "wapilot", "waAiAgent"].includes(root)) {
++    if (!isMutation) return "whatsapp.view";
++    if (hasAction(path, ["setting", "account", "instance", "config", "provider", "campaign", "knowledge"])) return "whatsapp.manage";
++    return "whatsapp.reply";
++  }
++
++  if (root === "trash") {
++    if (!isMutation) return "trash.view";
++    return hasAction(path, ["permanent", "purge"]) ? "trash.permanentDelete" : "trash.restore";
++  }
++
++  if (root === "auditLogs") return isMutation ? "audit.manage" : "audit.view";
++  if (["users", "teams"].includes(root)) return isMutation ? "users.manage" : "users.view";
++  if (root === "support") return "support.view";
++
++  if (["settings", "authIntegrations", "dynamicServices", "googleDriveFileStorage", "backupCenter", "notifications"].includes(root)) {
++    return isMutation ? "settings.manage" : "settings.view";
++  }
++
++  return null;
++}
+
+diff --git a/server/_core/trpc.ts b/server/_core/trpc.ts
+--- a/server/_core/trpc.ts
++++ b/server/_core/trpc.ts
+@@ -3,7 +3,7 @@ import { NOT_ADMIN_ERR_MSG, UNAUTHED_ERR_MSG } from '@shared/const';
+ import { initTRPC, TRPCError } from "@trpc/server";
+ import superjson from "superjson";
+ import type { TrpcContext } from "./context";
+-import { hasEffectiveRolePermission } from "../services/rolePermissionsService";
++import { getRequiredPermissionForProcedure, hasEffectiveRolePermission } from "../services/rolePermissionsService";
+@@ -242,6 +242,13 @@ const requireUser = t.middleware(async opts => {
+   if (!ctx.user) {
+     throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+   }
++
++  const requiredPermission = getRequiredPermissionForProcedure(
++    opts.path,
++    opts.type === "mutation" ? "mutation" : opts.type === "subscription" ? "subscription" : "query",
++  );
++  if (requiredPermission && !(await hasEffectiveRolePermission(ctx.user.role, requiredPermission))) {
++    throw new TRPCError({ code: "FORBIDDEN", message: `Forbidden: Missing required permission: ${requiredPermission}` });
++  }
+ 
+   return next({
+     ctx: {
+
+diff --git a/server/routers.ts b/server/routers.ts
+--- a/server/routers.ts
++++ b/server/routers.ts
+@@ -600,28 +600,13 @@ const mediaBuyerOrAdminProcedure = protectedProcedure.use(({ ctx, next }) => {
+   return next({ ctx });
+ });
+ 
+-const clientOpsProcedure = permissionProcedure("accounts.view").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "AccountManager", "AccountManagerLead"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Client operations access required" });
+-  }
+-  return next({ ctx });
+-});
++const clientOpsProcedure = permissionProcedure("accounts.view");
+@@ -735,22 +720,8 @@ async function readEmaarAuditRow(table: any, id: number) {
+   return row ?? null;
+ }
+ 
+-const salesReadProcedure = permissionProcedure("sales.view").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || isMediaBuyerRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "AccountManager", "AccountManagerLead"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Sales workspace access required" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const salesEditProcedure = permissionProcedure("sales.edit").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Sales edit access required" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const automotiveReadProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Automotive workspace access required" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const automotiveWriteProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Automotive edit access required" });
+-  }
+-  return next({ ctx });
+-});
++const salesReadProcedure = permissionProcedure("sales.view");
++const salesEditProcedure = permissionProcedure("sales.edit");
++const automotiveReadProcedure = permissionProcedure("sales.view");
++const automotiveWriteProcedure = permissionProcedure("sales.edit");
+@@ -820,35 +791,27 @@ function canViewWapilotRawDetails(user: { email?: string | null; role?: string |
+   return isPrimarySuperAdmin(user) || isAdminRole(user.role);
+ }
+ 
+-const wapilotAdminProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isPrimarySuperAdmin(ctx.user) || isAdminRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "WA settings access requires Admin" });
+-  }
+-  return next({ ctx });
+-});
++const wapilotAdminProcedure = permissionProcedure("whatsapp.manage");
+ 
+ function getWapilotAccessScope(user: { id: number; email?: string | null; role?: string | null }, mode: "read" | "write") {
+   if (isPrimarySuperAdmin(user)) return "all" as const;
+   try {
+     return assertWapilotRoleAccess(user.role, mode);
+-  } catch (error: any) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: error?.message || "WA chat access denied" });
++  } catch {
++    // A dynamically-authorized role defaults to own/assigned conversations.
++    // The permissionProcedure below decides whether it may read/write.
++    return "own" as const;
+   }
+ }
+ 
+-const wapilotChatReadProcedure = protectedProcedure.use(({ ctx, next }) => {
++const wapilotChatReadProcedure = permissionProcedure("whatsapp.view").use(({ ctx, next }) => {
+   getWapilotAccessScope(ctx.user, "read");
+   return next({ ctx });
+ });
+ 
+-const wapilotChatWriteProcedure = protectedProcedure.use(({ ctx, next }) => {
++const wapilotChatWriteProcedure = permissionProcedure("whatsapp.reply").use(({ ctx, next }) => {
+   getWapilotAccessScope(ctx.user, "write");
+   return next({ ctx });
+ });
+@@ -985,38 +948,13 @@ function buildSupportRequestCode(): string {
+   return `SC-${new Date().getFullYear()}-${nanoid(8).toUpperCase()}`;
+ }
+ 
+-const marketingCenterProcedure = permissionProcedure("marketing.view").use(({ ctx, next }) => {
+-  if (!(isAdminRole(ctx.user.role) || isMediaBuyerRole(ctx.user.role) || isManagerRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Marketing Center access required" });
+-  }
+-  return next({ ctx });
+-});
++const marketingCenterProcedure = permissionProcedure("marketing.view");
+@@ -998,22 +936,8 @@ function getPublicBaseUrl(req: any): string {
+   return proto + "://" + host;
+ }
+ 
+-const aiSocialReadProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  const role = normalizeUserRole(ctx.user.role);
+-  if (!["Admin", "SalesManager", "MediaBuyer", "SalesAgent", "CrmFollowUp"].includes(role)) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "AI Social Agent access required" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const aiSocialSetupProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  const role = normalizeUserRole(ctx.user.role);
+-  if (role !== "Admin") {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Only Admin can configure AI Social Agents" });
+-  }
+-  return next({ ctx });
+-});
++const aiSocialReadProcedure = permissionProcedure("marketing.view");
++const aiSocialSetupProcedure = permissionProcedure("marketing.manage");
+@@ -1018,32 +942,9 @@ const aiSocialSetupProcedure = protectedProcedure.use(({ ctx, next }) => {
+-const waAiConfigProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!isAdminRole(ctx.user.role)) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Only Admin can configure Tara" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const waAiManageProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!isManagerRole(ctx.user.role)) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Tara campaign/knowledge management requires Admin or Sales Manager" });
+-  }
+-  return next({ ctx });
+-});
+-
+-const waAiActProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  const role = normalizeUserRole(ctx.user.role);
+-  if (!["Admin", "SalesManager", "SalesAgent"].includes(role)) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Tara conversation actions require Admin, Sales Manager, or Sales Agent" });
+-  }
+-  return next({ ctx });
+-});
++const waAiConfigProcedure = permissionProcedure("whatsapp.manage");
++const waAiManageProcedure = permissionProcedure("whatsapp.manage");
++const waAiActProcedure = permissionProcedure("whatsapp.reply");
+
+diff --git a/server/routes/bd/index.ts b/server/routes/bd/index.ts
+--- a/server/routes/bd/index.ts
++++ b/server/routes/bd/index.ts
+@@ -3,6 +3,7 @@ import { authenticateRequest } from "../../auth";
+ import { getDb } from "../../db";
+ import { bdUserAccess } from "../../../drizzle/schema_bd";
+ import { and, eq } from "drizzle-orm";
++import { hasEffectiveRolePermission } from "../../services/rolePermissionsService";
+@@ -39,6 +40,11 @@ async function requireBdAccess(req: BdAuthedRequest, res: Response, next: NextFun
+     const user = await authenticateRequest(req);
+     if (!user) return res.status(401).json({ error: "unauthorized" });
++
++    if (!(await hasEffectiveRolePermission(user.role, "businessDevelopment.view"))) {
++      return res.status(403).json({ error: "business_development_permission_required" });
++    }
+ 
+     const db = await getDb();
+@@ -51,9 +57,13 @@ async function requireBdAccess(req: BdAuthedRequest, res: Response, next: NextFun
+       .limit(1);
+ 
+-    // Admin/SalesManager auto-granted; others require explicit row
+-    const isAuto = user.role === "Admin" || user.role === "SalesManager";
+-    const bdRole = access[0]?.role ?? (isAuto ? "bd_admin" : null);
+-    if (!bdRole) return res.status(403).json({ error: "bd_access_required" });
++    const canManage = await hasEffectiveRolePermission(user.role, "businessDevelopment.manage");
++    const canEdit = canManage || await hasEffectiveRolePermission(user.role, "businessDevelopment.edit");
++    const dynamicBdRole = canManage ? "bd_admin" : canEdit ? "bd_rep" : "bd_viewer";
++    // Keep an explicit per-user BD role when one exists; otherwise derive a safe role from dynamic RBAC.
++    const bdRole = access[0]?.role ?? dynamicBdRole;
+@@ -71,9 +81,29 @@ async function requireBdAccess(req: BdAuthedRequest, res: Response, next: NextFun
+   }
+ }
++
++async function requireBdMethodPermission(req: BdAuthedRequest, res: Response, next: NextFunction) {
++  try {
++    const appRole = req.bdUser?.role;
++    if (!appRole) return res.status(401).json({ error: "unauthorized" });
++    const method = String(req.method || "GET").toUpperCase();
++    const readOnly = method === "GET" || method === "HEAD" || method === "OPTIONS";
++    const managePath = req.path === "/access" || req.path.startsWith("/access/") || req.path === "/advanced" || req.path.startsWith("/advanced/");
++    const permission = managePath
++      ? "businessDevelopment.manage"
++      : readOnly
++        ? "businessDevelopment.view"
++        : "businessDevelopment.edit";
++    if (!(await hasEffectiveRolePermission(appRole, permission))) {
++      return res.status(403).json({ error: "business_development_permission_required", permission });
++    }
++    next();
++  } catch (err) {
++    next(err);
++  }
++}
+ 
+ export function createBdRouter() {
+   const router = Router();
+   router.use(requireBdAccess);
++  router.use(requireBdMethodPermission);
+   router.use("/", advancedRouter);
+
+diff --git a/server/routes/central-chat-native.ts b/server/routes/central-chat-native.ts
+--- a/server/routes/central-chat-native.ts
++++ b/server/routes/central-chat-native.ts
+@@ -5,6 +5,7 @@ import { and, asc, eq, isNull, ne } from "drizzle-orm";
+ import { getDb } from "../db";
+ import { authenticateRequest } from "../auth";
+ import { users } from "../../drizzle/schema";
++import { hasEffectiveRolePermission } from "../services/rolePermissionsService";
+@@ -102,6 +103,13 @@ async function requireCurrentUser(req: Request, res: Response) {
+     res.status(401).json({ message: "Unauthorized" });
+     return null;
+   }
++
++  const method = String(req.method || "GET").toUpperCase();
++  const permission = method === "GET" || method === "HEAD" ? "chat.view" : "chat.reply";
++  if (!(await hasEffectiveRolePermission(user.role, permission))) {
++    res.status(403).json({ message: "Forbidden", permission });
++    return null;
++  }
+   return user as LocalCrmUser;
+ }
+
+diff --git a/server/_core/index.ts b/server/_core/index.ts
+--- a/server/_core/index.ts
++++ b/server/_core/index.ts
+@@ -54,6 +54,7 @@ import { storageGetPath } from "../storage";
+ import { isAdminRole, isManagerRole, isSalesAgentRole, normalizeUserRole } from "../roleUtils";
++import { hasEffectiveRolePermission } from "../services/rolePermissionsService";
+@@ -470,6 +471,9 @@ async function startServer() {
+       }
+       const user = await authenticateRequest(req);
+       if (!user) return res.status(401).json({ success: false, error: "Authentication required" });
++      if (!(await hasEffectiveRolePermission(user.role, "whatsapp.reply"))) {
++        return res.status(403).json({ success: false, error: "WhatsApp reply permission required" });
++      }
+       const userId = Number(user.id || 0);
+@@ -530,6 +534,9 @@ async function startServer() {
+     try {
+       const user = await authenticateRequest(req);
+       if (!user) return res.status(401).json({ success: false, error: "Authentication required" });
++      if (!(await hasEffectiveRolePermission(user.role, "whatsapp.view"))) {
++        return res.status(403).json({ success: false, error: "WhatsApp view permission required" });
++      }
+       const media = await getWAGatewayMessageMedia({ messageId: Number(req.params.messageId || 0), actor: user });
+@@ -846,7 +853,7 @@ async function startServer() {
+     try {
+       const user = await authenticateRequest(req as any).catch(() => null);
+       if (!user) { res.status(401).json({ error: "Unauthorized" }); return; }
+-      if (!isManagerRole(user.role)) { res.status(403).json({ error: "Sales manager access required" }); return; }
++      if (!(await hasEffectiveRolePermission(user.role, "sales.reports"))) { res.status(403).json({ error: "Sales reports permission required" }); return; }
+       const { createExportJob } = await import("../services/exportCenterService.js");
+@@ -860,7 +867,7 @@ async function startServer() {
+     try {
+       const user = await authenticateRequest(req as any).catch(() => null);
+       if (!user) { res.status(401).json({ error: "Unauthorized" }); return; }
+-      if (!isManagerRole(user.role)) { res.status(403).json({ error: "Sales manager access required" }); return; }
++      if (!(await hasEffectiveRolePermission(user.role, "sales.reports"))) { res.status(403).json({ error: "Sales reports permission required" }); return; }
+       const { listExportJobs } = await import("../services/exportCenterService.js");
+@@ -873,7 +880,7 @@ async function startServer() {
+     try {
+       const user = await authenticateRequest(req as any).catch(() => null);
+       if (!user) { res.status(401).json({ error: "Unauthorized" }); return; }
+-      if (!isManagerRole(user.role)) { res.status(403).json({ error: "Sales manager access required" }); return; }
++      if (!(await hasEffectiveRolePermission(user.role, "sales.reports"))) { res.status(403).json({ error: "Sales reports permission required" }); return; }
+       const { getJobDownloadPath } = await import("../services/exportCenterService.js");
