@@ -1,0 +1,241 @@
+diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
+--- a/server/services/rbacService.ts
++++ b/server/services/rbacService.ts
+@@ -16,6 +16,42 @@
+ 
+ let warnedSchemaUnavailable = false;
+ 
++function isMissingRbacSchemaError(error: unknown): boolean {
++  const queue: unknown[] = [error];
++  const seen = new Set<unknown>();
++  while (queue.length) {
++    const current = queue.shift();
++    if (!current || seen.has(current)) continue;
++    seen.add(current);
++    const value = current as any;
++    const code = String(value?.code ?? "");
++    const errno = Number(value?.errno);
++    const message = String(value?.message ?? "");
++    if (
++      code === "ER_NO_SUCH_TABLE" ||
++      errno === 1146 ||
++      (/ttcrm_rbac_/i.test(message) && /(doesn't exist|does not exist|unknown table)/i.test(message))
++    ) return true;
++    if (value?.cause) queue.push(value.cause);
++  }
++  return false;
++}
++
++function warnMigrationFallback(error: unknown) {
++  if (warnedSchemaUnavailable) return;
++  warnedSchemaUnavailable = true;
++  console.warn("[RBAC] Phase 1 schema is missing; migration fallback is active", error);
++}
++
++function failClosedRbacError(operation: string) {
++  return new TRPCError({ code: "FORBIDDEN", message: `RBAC ${operation} failed closed` });
++}
++
++function parseJsonValue(value: unknown): unknown {
++  if (value == null || typeof value === "object") return value ?? null;
++  try { return JSON.parse(String(value)); } catch { return value; }
++}
++
+ function isKnownModule(value: unknown): value is TtcrmRbacModule {
+   return TTCRM_RBAC_MODULES.includes(String(value) as TtcrmRbacModule);
+ }
+@@ -100,11 +136,12 @@
+     }
+     return matrix;
+   } catch (error) {
+-    if (!warnedSchemaUnavailable) {
+-      warnedSchemaUnavailable = true;
+-      console.warn("[RBAC] Dynamic RBAC schema unavailable; using safe default matrices", error);
+-    }
+-    return null;
++    if (isMissingRbacSchemaError(error)) {
++      warnMigrationFallback(error);
++      return null;
++    }
++    console.error("[RBAC] Permission matrix lookup failed closed", error);
++    throw failClosedRbacError("permission lookup");
+   }
+ }
+ 
+@@ -124,9 +161,13 @@
+     `);
+     const assignedRoleKey = rowsOf(result)[0]?.roleKey;
+     return assignedRoleKey ? String(assignedRoleKey) : fallbackRoleKey;
+-  } catch {
+-    // Phase 1 migration may not have been applied yet. Preserve legacy role behavior.
+-    return fallbackRoleKey;
++  } catch (error) {
++    if (isMissingRbacSchemaError(error)) {
++      warnMigrationFallback(error);
++      return fallbackRoleKey;
++    }
++    console.error("[RBAC] Effective role lookup failed closed", error);
++    throw failClosedRbacError("role lookup");
+   }
+ }
+ 
+@@ -231,6 +272,103 @@
+   }));
+ }
+ 
++
++export async function getTtcrmRbacSecurityStatus() {
++  const db = await getDb();
++  if (!db) {
++    return {
++      schemaReady: false,
++      migrationFallbackActive: true,
++      failClosedOnUnexpectedErrors: true,
++      reason: "database-unavailable" as const,
++      rolesCount: 0,
++      permissionRowsCount: 0,
++      assignmentsCount: 0,
++      auditRowsCount: 0,
++    };
++  }
++
++  try {
++    const result = await db.execute(sql`
++      SELECT
++        (SELECT COUNT(*) FROM ttcrm_rbac_roles) AS rolesCount,
++        (SELECT COUNT(*) FROM ttcrm_rbac_role_permissions) AS permissionRowsCount,
++        (SELECT COUNT(*) FROM ttcrm_rbac_user_roles WHERE is_primary = 1) AS assignmentsCount,
++        (SELECT COUNT(*) FROM ttcrm_rbac_audit_log) AS auditRowsCount
++    `);
++    const row = rowsOf(result)[0] ?? {};
++    return {
++      schemaReady: true,
++      migrationFallbackActive: false,
++      failClosedOnUnexpectedErrors: true,
++      reason: "ready" as const,
++      rolesCount: Number(row.rolesCount ?? 0),
++      permissionRowsCount: Number(row.permissionRowsCount ?? 0),
++      assignmentsCount: Number(row.assignmentsCount ?? 0),
++      auditRowsCount: Number(row.auditRowsCount ?? 0),
++    };
++  } catch (error) {
++    if (isMissingRbacSchemaError(error)) {
++      warnMigrationFallback(error);
++      return {
++        schemaReady: false,
++        migrationFallbackActive: true,
++        failClosedOnUnexpectedErrors: true,
++        reason: "rbac-schema-missing" as const,
++        rolesCount: 0,
++        permissionRowsCount: 0,
++        assignmentsCount: 0,
++        auditRowsCount: 0,
++      };
++    }
++    console.error("[RBAC] Security status check detected a schema/database error", error);
++    return {
++      schemaReady: false,
++      migrationFallbackActive: false,
++      failClosedOnUnexpectedErrors: true,
++      reason: "rbac-schema-error" as const,
++      rolesCount: 0,
++      permissionRowsCount: 0,
++      assignmentsCount: 0,
++      auditRowsCount: 0,
++    };
++  }
++}
++
++export async function listTtcrmRbacAuditLog(limit = 50) {
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++  const safeLimit = Math.min(Math.max(Math.trunc(limit) || 50, 1), 100);
++  const result = await db.execute(sql`
++    SELECT a.id,
++           a.actor_user_id AS actorUserId,
++           u.name AS actorName,
++           u.email AS actorEmail,
++           a.action,
++           a.target_type AS targetType,
++           a.target_id AS targetId,
++           a.before_json AS beforeJson,
++           a.after_json AS afterJson,
++           a.created_at AS createdAt
++    FROM ttcrm_rbac_audit_log a
++    LEFT JOIN users u ON u.id = a.actor_user_id
++    ORDER BY a.id DESC
++    LIMIT ${safeLimit}
++  `);
++  return rowsOf(result).map((row) => ({
++    id: Number(row.id),
++    actorUserId: Number(row.actorUserId),
++    actorName: row.actorName ?? null,
++    actorEmail: row.actorEmail ?? null,
++    action: String(row.action ?? ""),
++    targetType: String(row.targetType ?? ""),
++    targetId: row.targetId == null ? null : String(row.targetId),
++    before: parseJsonValue(row.beforeJson),
++    after: parseJsonValue(row.afterJson),
++    createdAt: row.createdAt ?? null,
++  }));
++}
++
+ export async function saveTtcrmRbacRole(actorUserId: number, input: TtcrmRoleSaveInput) {
+   if (input.roleKey === "Admin") {
+     throw new TRPCError({ code: "FORBIDDEN", message: "Admin is a protected system role" });
+@@ -343,8 +481,18 @@
+     const role = rowsOf(roleResult)[0];
+     if (!role) throw new TRPCError({ code: "NOT_FOUND", message: "Role not found or disabled" });
+     const currentLegacyRole = normalizeUserRole(user.role);
+-    if (currentLegacyRole === "Admin" && roleKey !== "Admin") {
+-      throw new TRPCError({ code: "FORBIDDEN", message: "Admin assignment is protected during RBAC migration" });
++    const previousAssignmentResult = await tx.execute(sql`
++      SELECT r.role_key AS roleKey
++      FROM ttcrm_rbac_user_roles ur
++      INNER JOIN ttcrm_rbac_roles r ON r.id = ur.role_id
++      WHERE ur.user_id = ${userId} AND ur.is_primary = 1
++      ORDER BY ur.id DESC
++      LIMIT 1
++    `);
++    const previousAssignedRoleKey = rowsOf(previousAssignmentResult)[0]?.roleKey;
++    const currentEffectiveRoleKey = previousAssignedRoleKey ? String(previousAssignedRoleKey) : currentLegacyRole;
++    if (currentEffectiveRoleKey === "Admin" && roleKey !== "Admin") {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Admin assignment is protected and cannot be downgraded" });
+     }
+     await tx.execute(sql`UPDATE ttcrm_rbac_user_roles SET is_primary = 0 WHERE user_id = ${userId}`);
+     await tx.execute(sql`
+@@ -360,7 +508,8 @@
+     await tx.execute(sql`
+       INSERT INTO ttcrm_rbac_audit_log (actor_user_id, action, target_type, target_id, before_json, after_json)
+       VALUES (${actorUserId}, 'user.role.assign', 'user', ${String(userId)},
+-              ${JSON.stringify({ roleKey: currentLegacyRole })}, ${JSON.stringify({ roleKey })})
++              ${JSON.stringify({ roleKey: currentEffectiveRoleKey, legacyRole: currentLegacyRole })},
++              ${JSON.stringify({ roleKey, legacyRoleSynced: Boolean(role.isSystem) })})
+     `);
+     return {
+       success: true as const,
+ diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
+--- a/server/rbacRouter.ts
++++ b/server/rbacRouter.ts
+@@ -6,6 +6,8 @@
+   assignTtcrmRbacUserRole,
+   disableTtcrmRbacRole,
+   getEffectiveTtcrmPermissions,
++  getTtcrmRbacSecurityStatus,
++  listTtcrmRbacAuditLog,
+   listTtcrmRbacRoles,
+   listTtcrmRbacUsers,
+   resolveEffectiveTtcrmRoleKey,
+@@ -52,6 +54,12 @@
+ 
+   listRoles: adminProcedure.query(() => listTtcrmRbacRoles()),
+ 
++  securityStatus: adminProcedure.query(() => getTtcrmRbacSecurityStatus()),
++
++  auditLog: adminProcedure
++    .input(z.object({ limit: z.number().int().min(1).max(100).optional() }).optional())
++    .query(({ input }) => listTtcrmRbacAuditLog(input?.limit ?? 50)),
++
+   saveRole: adminProcedure
+     .input(z.object({
+       roleKey: roleKeySchema,
