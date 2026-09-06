@@ -1,0 +1,272 @@
+diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
+--- a/client/src/pages/AdminSettings.tsx
++++ b/client/src/pages/AdminSettings.tsx
+@@ -1,3 +1,4 @@
+ import FinanceSettingsTab from "@/components/FinanceSettingsTab";
+ import RolePermissionsStudio from "@/components/RolePermissionsStudio";
++import RbacUserRoleManager from "@/components/RbacUserRoleManager";
+ import { useState, useEffect } from "react";
+@@ -14,5 +15,8 @@ function X(){
+               onAssignRole={({ id, role }) => updateUser.mutate({ id, role } as any)}
+             />
++            <div className="mt-4">
++              <RbacUserRoleManager isRTL={isRTL} currentUserId={user?.id} />
++            </div>
+           </TabsContent>}
+   </>
+ }
+diff --git a/client/src/components/RbacUserRoleManager.tsx b/client/src/components/RbacUserRoleManager.tsx
+new file mode 100644
+--- /dev/null
++++ b/client/src/components/RbacUserRoleManager.tsx
+@@ -0,0 +1,250 @@
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Input } from "@/components/ui/input";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { trpc } from "@/lib/trpc";
++import { AlertTriangle, CheckCircle2, LockKeyhole, RefreshCw, Search, ShieldCheck, UserCog } from "lucide-react";
++import { useMemo, useState } from "react";
++import { toast } from "sonner";
++
++type Props = {
++  isRTL: boolean;
++  currentUserId?: number | null;
++};
++
++export default function RbacUserRoleManager({ isRTL, currentUserId }: Props) {
++  const utils = trpc.useUtils();
++  const usersQuery = trpc.rbac.listUsers.useQuery(undefined, {
++    retry: false,
++    refetchOnWindowFocus: false,
++  });
++  const rolesQuery = trpc.rbac.listRoles.useQuery(undefined, {
++    retry: false,
++    refetchOnWindowFocus: false,
++  });
++  const assignMutation = trpc.rbac.assignUserRole.useMutation();
++
++  const [search, setSearch] = useState("");
++  const [pendingRoles, setPendingRoles] = useState<Record<number, string>>({});
++  const [assigningUserId, setAssigningUserId] = useState<number | null>(null);
++
++  const users = usersQuery.data ?? [];
++  const roles = rolesQuery.data ?? [];
++  const roleMap = useMemo(
++    () => new Map(roles.map((role) => [String(role.roleKey), role])),
++    [roles],
++  );
++
++  const filteredUsers = useMemo(() => {
++    const query = search.trim().toLowerCase();
++    if (!query) return users;
++    return users.filter((user) =>
++      [user.name, user.email, user.roleKey, user.legacyRole, user.roleNameAr, user.roleNameEn]
++        .filter(Boolean)
++        .some((value) => String(value).toLowerCase().includes(query)),
++    );
++  }, [search, users]);
++
++  function selectedRoleFor(user: (typeof users)[number]) {
++    const pending = pendingRoles[user.id];
++    if (pending) return pending;
++    const current = String(user.roleKey ?? "");
++    return roleMap.has(current) ? current : "";
++  }
++
++  async function assignRole(userId: number, currentRoleKey: string) {
++    const roleKey = pendingRoles[userId];
++    if (!roleKey || roleKey === currentRoleKey) return;
++    setAssigningUserId(userId);
++    try {
++      const result = await assignMutation.mutateAsync({ userId, roleKey });
++      setPendingRoles((current) => {
++        const next = { ...current };
++        delete next[userId];
++        return next;
++      });
++      await Promise.all([
++        utils.rbac.listUsers.invalidate(),
++        utils.rbac.me.invalidate(),
++      ]);
++      toast.success(
++        isRTL
++          ? `تم تعيين الدور ${roleKey}${result.legacyRoleSynced ? " ومزامنة الدور الأساسي" : ""}`
++          : `Role ${roleKey} assigned${result.legacyRoleSynced ? " and legacy role synced" : ""}`,
++      );
++    } catch (error: any) {
++      toast.error(error?.message || (isRTL ? "تعذر تعيين الدور" : "Could not assign role"));
++    } finally {
++      setAssigningUserId(null);
++    }
++  }
++
++  const loading = usersQuery.isLoading || rolesQuery.isLoading;
++  const apiError = usersQuery.error?.message || rolesQuery.error?.message;
++
++  return (
++    <Card className="overflow-hidden rounded-2xl" dir={isRTL ? "rtl" : "ltr"}>
++      <CardHeader className="border-b pb-4">
++        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
++          <div>
++            <CardTitle className="flex items-center gap-2 text-base">
++              <UserCog className="h-5 w-5 text-primary" />
++              {isRTL ? "تعيين الأدوار للمستخدمين" : "User Role Assignment"}
++            </CardTitle>
++            <p className="mt-1 text-xs text-muted-foreground">
++              {isRTL
++                ? "اربط كل مستخدم بدور System أو Custom. الدور الظاهر هنا هو الـ Effective Role المستخدم بواسطة RBAC."
++                : "Assign each user to a system or custom role. The displayed role is the effective RBAC role."}
++            </p>
++          </div>
++          <div className="flex items-center gap-2">
++            <div className="relative w-full min-w-0 sm:w-72">
++              <Search className="absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
++              <Input
++                className="ps-9"
++                value={search}
++                onChange={(event) => setSearch(event.target.value)}
++                placeholder={isRTL ? "بحث بالاسم أو البريد أو الدور..." : "Search name, email or role..."}
++              />
++            </div>
++            <Button
++              variant="outline"
++              size="icon"
++              disabled={loading}
++              onClick={() => Promise.all([usersQuery.refetch(), rolesQuery.refetch()])}
++              title={isRTL ? "تحديث" : "Refresh"}
++            >
++              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
++            </Button>
++          </div>
++        </div>
++      </CardHeader>
++
++      <CardContent className="p-0">
++        {loading ? (
++          <div className="flex min-h-48 items-center justify-center gap-2 text-sm text-muted-foreground">
++            <RefreshCw className="h-4 w-4 animate-spin" />
++            {isRTL ? "جاري تحميل المستخدمين والأدوار..." : "Loading users and roles..."}
++          </div>
++        ) : apiError ? (
++          <div className="flex min-h-40 items-start gap-3 p-6 text-destructive">
++            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
++            <div>
++              <div className="font-semibold">{isRTL ? "تعذر تحميل تعيينات الأدوار" : "Could not load role assignments"}</div>
++              <div className="mt-1 text-sm opacity-80">{apiError}</div>
++            </div>
++          </div>
++        ) : (
++          <div className="overflow-x-auto">
++            <table className="w-full min-w-[980px] text-sm">
++              <thead>
++                <tr className="border-b bg-muted/30">
++                  <th className="px-4 py-3 text-start text-xs font-semibold">{isRTL ? "المستخدم" : "User"}</th>
++                  <th className="px-4 py-3 text-start text-xs font-semibold">{isRTL ? "الدور الفعلي" : "Effective Role"}</th>
++                  <th className="px-4 py-3 text-start text-xs font-semibold">{isRTL ? "الدور الأساسي" : "Legacy Role"}</th>
++                  <th className="px-4 py-3 text-start text-xs font-semibold">{isRTL ? "الدور الجديد" : "New Role"}</th>
++                  <th className="px-4 py-3 text-center text-xs font-semibold">{isRTL ? "حفظ" : "Save"}</th>
++                </tr>
++              </thead>
++              <tbody>
++                {filteredUsers.map((user) => {
++                  const currentRoleKey = String(user.roleKey ?? "");
++                  const currentRole = roleMap.get(currentRoleKey);
++                  const selectedRole = selectedRoleFor(user);
++                  const selectedRoleMeta = roleMap.get(selectedRole);
++                  const adminProtected = String(user.legacyRole) === "Admin";
++                  const changed = Boolean(selectedRole) && selectedRole !== currentRoleKey;
++                  const assigning = assigningUserId === user.id && assignMutation.isPending;
++                  return (
++                    <tr key={user.id} className="border-b last:border-b-0 hover:bg-muted/20">
++                      <td className="px-4 py-3">
++                        <div className="flex items-center gap-2">
++                          <div className="min-w-0">
++                            <div className="flex items-center gap-2 font-medium">
++                              <span className="truncate">{user.name || user.email || `#${user.id}`}</span>
++                              {Number(user.id) === Number(currentUserId) && (
++                                <Badge variant="secondary" className="text-[10px]">{isRTL ? "أنت" : "You"}</Badge>
++                              )}
++                              {adminProtected && <LockKeyhole className="h-3.5 w-3.5 text-muted-foreground" />}
++                            </div>
++                            <div className="mt-0.5 text-xs text-muted-foreground">{user.email || "—"}</div>
++                          </div>
++                        </div>
++                      </td>
++                      <td className="px-4 py-3">
++                        <div className="flex flex-wrap items-center gap-2">
++                          <Badge variant={user.roleActive === false ? "destructive" : "outline"}>{currentRoleKey || "—"}</Badge>
++                          {currentRole && (
++                            <Badge variant="secondary" className="text-[10px]">
++                              {currentRole.isSystem ? "System" : "Custom"}
++                            </Badge>
++                          )}
++                          {user.roleActive === false && (
++                            <span className="text-xs text-destructive">{isRTL ? "الدور معطل" : "Role disabled"}</span>
++                          )}
++                        </div>
++                      </td>
++                      <td className="px-4 py-3">
++                        <Badge variant="outline" className="font-mono text-[11px]">{String(user.legacyRole || "—")}</Badge>
++                      </td>
++                      <td className="px-4 py-3">
++                        {adminProtected ? (
++                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
++                            <ShieldCheck className="h-4 w-4" />
++                            {isRTL ? "Admin محمي" : "Protected Admin"}
++                          </div>
++                        ) : (
++                          <Select
++                            value={selectedRole}
++                            onValueChange={(roleKey) => setPendingRoles((current) => ({ ...current, [user.id]: roleKey }))}
++                          >
++                            <SelectTrigger className="h-9 min-w-[220px]">
++                              <SelectValue placeholder={isRTL ? "اختر دورًا" : "Select role"} />
++                            </SelectTrigger>
++                            <SelectContent>
++                              {roles.map((role) => (
++                                <SelectItem key={String(role.roleKey)} value={String(role.roleKey)}>
++                                  <span className="flex items-center gap-2">
++                                    <span>{isRTL ? role.nameAr || role.nameEn : role.nameEn || role.nameAr}</span>
++                                    <span className="text-[10px] text-muted-foreground">({role.isSystem ? "System" : "Custom"})</span>
++                                  </span>
++                                </SelectItem>
++                              ))}
++                            </SelectContent>
++                          </Select>
++                        )}
++                      </td>
++                      <td className="px-4 py-3 text-center">
++                        {adminProtected ? (
++                          <LockKeyhole className="mx-auto h-4 w-4 text-muted-foreground" />
++                        ) : (
++                          <Button
++                            size="sm"
++                            className="gap-2"
++                            disabled={!changed || assigning || !selectedRoleMeta}
++                            onClick={() => assignRole(user.id, currentRoleKey)}
++                          >
++                            {assigning ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <CheckCircle2 className="h-3.5 w-3.5" />}
++                            {assigning ? (isRTL ? "جارٍ الحفظ" : "Saving") : (isRTL ? "تعيين" : "Assign")}
++                          </Button>
++                        )}
++                      </td>
++                    </tr>
++                  );
++                })}
++                {filteredUsers.length === 0 && (
++                  <tr>
++                    <td colSpan={5} className="px-4 py-10 text-center text-sm text-muted-foreground">
++                      {isRTL ? "لا توجد نتائج." : "No matching users."}
++                    </td>
++                  </tr>
++                )}
++              </tbody>
++            </table>
++          </div>
++        )}
++      </CardContent>
++    </Card>
++  );
++}
