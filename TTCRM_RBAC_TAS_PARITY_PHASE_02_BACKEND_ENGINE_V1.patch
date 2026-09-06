@@ -1,0 +1,329 @@
+diff --git a/shared/rbac.ts b/shared/rbac.ts
+new file mode 100644
+--- /dev/null
++++ b/shared/rbac.ts
+@@ -0,0 +1,159 @@
++import { normalizeUserRole } from "./permissions";
++
++export const TTCRM_RBAC_MODULES = [
++  "dashboard",
++  "inbox",
++  "chat",
++  "sales",
++  "marketing",
++  "email_marketing",
++  "accounts",
++  "finance",
++  "business_development",
++  "whatsapp",
++  "import",
++  "trash",
++  "audit_log",
++  "settings",
++  "users",
++  "support",
++] as const;
++
++export const TTCRM_RBAC_ACTIONS = [
++  "view",
++  "create",
++  "edit",
++  "delete",
++  "export",
++  "approve",
++  "assign",
++] as const;
++
++export const TTCRM_DATA_SCOPES = ["own", "assigned", "team", "branch", "all"] as const;
++
++export type TtcrmRbacModule = (typeof TTCRM_RBAC_MODULES)[number];
++export type TtcrmRbacAction = (typeof TTCRM_RBAC_ACTIONS)[number];
++export type TtcrmDataScope = (typeof TTCRM_DATA_SCOPES)[number];
++
++export type TtcrmPermissionGrant = Record<TtcrmRbacAction, boolean> & {
++  dataScope: TtcrmDataScope;
++};
++
++export type TtcrmPermissionMatrix = Partial<Record<TtcrmRbacModule, TtcrmPermissionGrant>>;
++
++export const grant = (
++  actions: Partial<Record<TtcrmRbacAction, boolean>>,
++  dataScope: TtcrmDataScope = "own",
++): TtcrmPermissionGrant => ({
++  view: false,
++  create: false,
++  edit: false,
++  delete: false,
++  export: false,
++  approve: false,
++  assign: false,
++  ...actions,
++  dataScope,
++});
++
++const full = (dataScope: TtcrmDataScope = "all") =>
++  grant({ view: true, create: true, edit: true, delete: true, export: true, approve: true, assign: true }, dataScope);
++
++const read = (dataScope: TtcrmDataScope = "own") => grant({ view: true }, dataScope);
++const engage = (dataScope: TtcrmDataScope = "assigned") => grant({ view: true, edit: true }, dataScope);
++const work = (dataScope: TtcrmDataScope = "assigned") => grant({ view: true, create: true, edit: true }, dataScope);
++
++export const DEFAULT_TTCRM_ROLE_MATRIX: Record<string, TtcrmPermissionMatrix> = {
++  Admin: Object.fromEntries(TTCRM_RBAC_MODULES.map((module) => [module, full("all")])) as TtcrmPermissionMatrix,
++  SalesManager: {
++    dashboard: read("team"),
++    inbox: engage("team"), chat: engage("team"), sales: full("team"),
++    marketing: full("all"), email_marketing: full("all"),
++    accounts: grant({ view: true, create: true, edit: true, assign: true }, "team"),
++    finance: read("team"), whatsapp: full("team"), settings: read("all"), users: read("team"), support: read("all"),
++  },
++  SalesAgent: {
++    dashboard: read("own"), inbox: engage("assigned"), chat: engage("assigned"),
++    sales: work("assigned"), whatsapp: engage("assigned"), support: read("own"),
++  },
++  SalesFinanceAccounting: {
++    dashboard: read("own"), inbox: engage("assigned"), chat: engage("assigned"),
++    sales: work("assigned"), finance: grant({ view: true, edit: true }, "all"),
++    accounts: work("assigned"), whatsapp: engage("assigned"), support: read("own"),
++  },
++  AccountManager: {
++    dashboard: read("own"), chat: engage("assigned"), accounts: work("assigned"),
++    whatsapp: engage("assigned"), support: read("own"),
++  },
++  AccountManagerLead: {
++    dashboard: read("team"), chat: engage("team"),
++    accounts: grant({ view: true, create: true, edit: true, delete: true, assign: true }, "team"),
++    sales: grant({ view: true, export: true }, "team"), whatsapp: engage("team"), support: read("team"),
++  },
++  ServiceAdvisor: {
++    dashboard: read("assigned"), inbox: engage("assigned"), chat: engage("assigned"),
++    sales: grant({ view: true, edit: true }, "assigned"), accounts: grant({ view: true, edit: true }, "assigned"),
++    whatsapp: engage("assigned"), settings: read("all"), support: read("own"),
++  },
++  PartsAgent: {
++    dashboard: read("assigned"), inbox: engage("assigned"), chat: engage("assigned"),
++    sales: grant({ view: true, edit: true }, "assigned"), accounts: grant({ view: true, edit: true }, "assigned"),
++    whatsapp: engage("assigned"), settings: read("all"), support: read("own"),
++  },
++  CrmFollowUp: {
++    dashboard: read("assigned"), inbox: engage("assigned"), chat: engage("assigned"),
++    sales: grant({ view: true, edit: true }, "assigned"), accounts: grant({ view: true, edit: true }, "assigned"),
++    whatsapp: engage("assigned"), settings: read("all"), support: read("own"),
++  },
++  Viewer: {
++    dashboard: read("all"), chat: read("all"), sales: grant({ view: true, export: true }, "all"), support: read("all"),
++  },
++  MediaBuyer: {
++    dashboard: read("all"), inbox: read("all"), chat: engage("all"), sales: read("all"),
++    marketing: full("all"), settings: read("all"), support: read("all"),
++  },
++  BusinessDeveloper: {
++    business_development: full("assigned"), email_marketing: full("all"), finance: read("all"), support: read("own"),
++  },
++};
++
++export function getDefaultTtcrmRoleMatrix(role?: string | null): TtcrmPermissionMatrix {
++  const normalized = normalizeUserRole(role);
++  return DEFAULT_TTCRM_ROLE_MATRIX[normalized] ?? {};
++}
++
++export function canFromTtcrmMatrix(
++  matrix: TtcrmPermissionMatrix,
++  module: TtcrmRbacModule,
++  action: TtcrmRbacAction,
++): boolean {
++  return Boolean(matrix[module]?.[action]);
++}
++
++export function scopeFromTtcrmMatrix(matrix: TtcrmPermissionMatrix, module: TtcrmRbacModule): TtcrmDataScope {
++  return matrix[module]?.dataScope ?? "own";
++}
+diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
+new file mode 100644
+--- /dev/null
++++ b/server/services/rbacService.ts
+@@ -0,0 +1,126 @@
++import { TRPCError } from "@trpc/server";
++import { sql } from "drizzle-orm";
++import { getDb } from "../db";
++import { normalizeUserRole } from "../../shared/permissions";
++import {
++  DEFAULT_TTCRM_ROLE_MATRIX,
++  TTCRM_DATA_SCOPES,
++  TTCRM_RBAC_MODULES,
++  canFromTtcrmMatrix,
++  scopeFromTtcrmMatrix,
++  type TtcrmDataScope,
++  type TtcrmPermissionMatrix,
++  type TtcrmRbacAction,
++  type TtcrmRbacModule,
++} from "../../shared/rbac";
++
++let warnedSchemaUnavailable = false;
++
++function isKnownModule(value: unknown): value is TtcrmRbacModule {
++  return TTCRM_RBAC_MODULES.includes(String(value) as TtcrmRbacModule);
++}
++
++function isKnownScope(value: unknown): value is TtcrmDataScope {
++  return TTCRM_DATA_SCOPES.includes(String(value) as TtcrmDataScope);
++}
++
++function defaultMatrixForRole(roleKey: string): TtcrmPermissionMatrix {
++  return DEFAULT_TTCRM_ROLE_MATRIX[roleKey] ?? {};
++}
++
++export async function getExplicitTtcrmRoleMatrix(roleKey: string): Promise<TtcrmPermissionMatrix | null> {
++  const db = await getDb();
++  if (!db) return null;
++
++  try {
++    const roleResult = await db.execute(sql`
++      SELECT id, is_system AS isSystem
++      FROM ttcrm_rbac_roles
++      WHERE role_key = ${roleKey} AND is_active = 1
++      LIMIT 1
++    `);
++    const role = (((roleResult as any)[0] ?? []) as any[])[0];
++    if (!role) return null;
++
++    const permissionsResult = await db.execute(sql`
++      SELECT module_key AS moduleKey,
++             can_view AS canView,
++             can_create AS canCreate,
++             can_edit AS canEdit,
++             can_delete AS canDelete,
++             can_export AS canExport,
++             can_approve AS canApprove,
++             can_assign AS canAssign,
++             data_scope AS dataScope
++      FROM ttcrm_rbac_role_permissions
++      WHERE role_id = ${Number(role.id)}
++    `);
++    const rows = ((permissionsResult as any)[0] ?? []) as any[];
++
++    // Phase 1 seeds system roles but intentionally does not seed permission rows.
++    // Until a system role is explicitly configured, preserve the legacy/default matrix.
++    if (!rows.length) return Number(role.isSystem) === 1 ? null : {};
++
++    const matrix: TtcrmPermissionMatrix = {};
++    for (const row of rows) {
++      if (!isKnownModule(row.moduleKey)) continue;
++      matrix[row.moduleKey] = {
++        view: Boolean(row.canView),
++        create: Boolean(row.canCreate),
++        edit: Boolean(row.canEdit),
++        delete: Boolean(row.canDelete),
++        export: Boolean(row.canExport),
++        approve: Boolean(row.canApprove),
++        assign: Boolean(row.canAssign),
++        dataScope: isKnownScope(row.dataScope) ? row.dataScope : "own",
++      };
++    }
++    return matrix;
++  } catch (error) {
++    if (!warnedSchemaUnavailable) {
++      warnedSchemaUnavailable = true;
++      console.warn("[RBAC] Dynamic RBAC schema unavailable; using safe default matrices", error);
++    }
++    return null;
++  }
++}
++
++export async function getEffectiveTtcrmPermissions(user: { id: number; role?: string | null }): Promise<TtcrmPermissionMatrix> {
++  const roleKey = normalizeUserRole(user.role);
++  if (roleKey === "Admin") return DEFAULT_TTCRM_ROLE_MATRIX.Admin;
++
++  const explicit = await getExplicitTtcrmRoleMatrix(roleKey);
++  if (explicit !== null) return explicit;
++  return defaultMatrixForRole(roleKey);
++}
++
++export async function hasEffectiveTtcrmPermission(
++  user: { id: number; role?: string | null },
++  module: TtcrmRbacModule,
++  action: TtcrmRbacAction,
++): Promise<boolean> {
++  const matrix = await getEffectiveTtcrmPermissions(user);
++  return canFromTtcrmMatrix(matrix, module, action);
++}
++
++export async function requireEffectiveTtcrmPermission(
++  user: { id: number; role?: string | null },
++  module: TtcrmRbacModule,
++  action: TtcrmRbacAction,
++): Promise<TtcrmDataScope> {
++  const matrix = await getEffectiveTtcrmPermissions(user);
++  if (!canFromTtcrmMatrix(matrix, module, action)) {
++    throw new TRPCError({ code: "FORBIDDEN", message: `Missing permission: ${module}.${action}` });
++  }
++  return scopeFromTtcrmMatrix(matrix, module);
++}
+diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
+new file mode 100644
+--- /dev/null
++++ b/server/rbacRouter.ts
+@@ -0,0 +1,22 @@
++import { protectedProcedure, router } from "./_core/trpc";
++import { normalizeUserRole } from "../shared/permissions";
++import { TTCRM_DATA_SCOPES, TTCRM_RBAC_ACTIONS, TTCRM_RBAC_MODULES } from "../shared/rbac";
++import { getEffectiveTtcrmPermissions } from "./services/rbacService";
++
++export const rbacRouter = router({
++  catalog: protectedProcedure.query(() => ({
++    modules: TTCRM_RBAC_MODULES,
++    actions: TTCRM_RBAC_ACTIONS,
++    dataScopes: TTCRM_DATA_SCOPES,
++  })),
++
++  me: protectedProcedure.query(async ({ ctx }) => ({
++    role: normalizeUserRole(ctx.user.role),
++    permissions: await getEffectiveTtcrmPermissions({
++      id: ctx.user.id,
++      role: ctx.user.role,
++    }),
++  })),
++});
+diff --git a/server/_core/trpc.ts b/server/_core/trpc.ts
+--- a/server/_core/trpc.ts
++++ b/server/_core/trpc.ts
+@@ -1,4 +1,6 @@
+ import { hasRolePermission, AppPermission } from "../../shared/permissions";
++import type { TtcrmRbacAction, TtcrmRbacModule } from "../../shared/rbac";
++import { hasEffectiveTtcrmPermission } from "../services/rbacService";
+ import { NOT_ADMIN_ERR_MSG, UNAUTHED_ERR_MSG } from '@shared/const';
+ import { initTRPC, TRPCError } from "@trpc/server";
+ import superjson from "superjson";
+@@ -225,6 +227,19 @@ export const permissionProcedureAny = (permissions: readonly AppPermission[]) =>
+     })
+   );
++
++// TAS-parity dynamic RBAC guard. Legacy permissionProcedure remains unchanged
++// until the module-by-module migration phases are completed.
++export const rbacProcedure = (module: TtcrmRbacModule, action: TtcrmRbacAction) =>
++  protectedProcedure.use(
++    t.middleware(async (opts) => {
++      const { ctx, next } = opts;
++      if (!ctx.user || !(await hasEffectiveTtcrmPermission(ctx.user, module, action))) {
++        throw new TRPCError({ code: "FORBIDDEN", message: `Forbidden: Missing required permission: ${module}.${action}` });
++      }
++      return next({ ctx });
++    }),
++  );
+diff --git a/server/routers.ts b/server/routers.ts
+--- a/server/routers.ts
++++ b/server/routers.ts
+@@ -10,6 +10,7 @@ import { COOKIE_NAME } from "@shared/const";
+ import { getSessionCookieOptions } from "./_core/cookies";
+ import { systemRouter } from "./_core/systemRouter";
++import { rbacRouter } from "./rbacRouter";
+ import {
+   getTfsIntegrationSettings,
+   getClientTfsSyncStatus,
+@@ -1188,6 +1189,7 @@ async function assertCrmFileRowAccess(ctx: any, row: any) {
+ 
+ export const appRouter = router({
+   system: systemRouter,
++  rbac: rbacRouter,
+ 
+   aiSocialAgent: router({
