@@ -1,0 +1,31 @@
+diff --git a/server/_core/index.ts b/server/_core/index.ts
+--- a/server/_core/index.ts
++++ b/server/_core/index.ts
+@@ -1414,11 +1414,22 @@ async function startServer() {
+   if (process.env.NODE_ENV === "development") {
+     await setupVite(app, server);
+   } else {
+     serveStatic(app);
+   }
+-  const preferredPort = parseInt(process.env.PORT || "3000");
+-  const port = await findAvailablePort(preferredPort);
+-  if (port !== preferredPort) {
++
++  const rawPort = String(process.env.PORT || "3000").trim();
++  const preferredPort = Number(rawPort);
++  if (!Number.isInteger(preferredPort) || preferredPort < 1 || preferredPort > 65535) {
++    throw new Error(`[Runtime] Invalid PORT "${rawPort}". Expected an integer between 1 and 65535.`);
++  }
++
++  // Production must bind to the exact upstream port configured in nginx/PM2.
++  // Silently moving to another port leaves nginx pointing at the old port and causes 502.
++  const isProduction = process.env.NODE_ENV === "production";
++  const port = isProduction ? preferredPort : await findAvailablePort(preferredPort);
++  if (isProduction) {
++    console.log(`[Runtime] Production port locked to ${port}; automatic fallback is disabled.`);
++  } else if (port !== preferredPort) {
+     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
+   }
+   await new Promise<void>((resolve, reject) => {
+     const onError = (error: Error) => reject(error);
+     server.once("error", onError);
