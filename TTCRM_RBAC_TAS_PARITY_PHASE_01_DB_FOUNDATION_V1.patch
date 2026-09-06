@@ -15,7 +15,7 @@ diff --git a/scripts/apply-ttcrm-rbac-v1-migration.ts b/scripts/apply-ttcrm-rbac
 new file mode 100644
 --- /dev/null
 +++ b/scripts/apply-ttcrm-rbac-v1-migration.ts
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,144 @@
 +import "dotenv/config";
 +import { sql } from "drizzle-orm";
 +import { getDb } from "../server/db";
@@ -164,7 +164,7 @@ diff --git a/scripts/verify-ttcrm-rbac-v1.ts b/scripts/verify-ttcrm-rbac-v1.ts
 new file mode 100644
 --- /dev/null
 +++ b/scripts/verify-ttcrm-rbac-v1.ts
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +import "dotenv/config";
 +import { sql } from "drizzle-orm";
 +import { getDb } from "../server/db";
