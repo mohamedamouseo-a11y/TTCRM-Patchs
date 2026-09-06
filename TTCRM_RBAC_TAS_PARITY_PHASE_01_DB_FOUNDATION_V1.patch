@@ -1,0 +1,244 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,9 @@
+     "format": "prettier --write .",
+     "test": "vitest run",
+     "db:push": "drizzle-kit generate && drizzle-kit migrate",
++    "db:dry-run:ttcrm-rbac-v1": "tsx scripts/apply-ttcrm-rbac-v1-migration.ts",
++    "db:migrate:ttcrm-rbac-v1": "tsx scripts/apply-ttcrm-rbac-v1-migration.ts --apply",
++    "db:verify:ttcrm-rbac-v1": "tsx scripts/verify-ttcrm-rbac-v1.ts",
+     "db:migrate:messenger": "tsx scripts/apply-messenger-migrations.ts",
+     "db:migrate:dynamic-workflow": "tsx scripts/apply-dynamic-workflow-migration.ts",
+     "db:migrate:google-drive-storage": "tsx scripts/apply-google-drive-storage-v2-migration.ts",
+diff --git a/scripts/apply-ttcrm-rbac-v1-migration.ts b/scripts/apply-ttcrm-rbac-v1-migration.ts
+new file mode 100644
+--- /dev/null
++++ b/scripts/apply-ttcrm-rbac-v1-migration.ts
+@@ -0,0 +1,149 @@
++import "dotenv/config";
++import { sql } from "drizzle-orm";
++import { getDb } from "../server/db";
++
++const APPLY = process.argv.includes("--apply");
++
++const SYSTEM_ROLES = [
++  ["Admin", "مدير النظام", "Admin"],
++  ["SalesManager", "مدير المبيعات", "Sales Manager"],
++  ["SalesAgent", "موظف مبيعات", "Sales Agent"],
++  ["SalesFinanceAccounting", "المبيعات والمالية والمحاسبة", "Sales Finance & Accounting"],
++  ["AccountManager", "مدير حساب", "Account Manager"],
++  ["AccountManagerLead", "قائد مديري الحسابات", "Account Manager Lead"],
++  ["ServiceAdvisor", "مستشار خدمة", "Service Advisor"],
++  ["PartsAgent", "مسؤول قطع غيار", "Parts Agent"],
++  ["CrmFollowUp", "متابعة CRM", "CRM Follow Up"],
++  ["Viewer", "مشاهدة فقط", "Viewer"],
++  ["MediaBuyer", "ميديا باير", "Media Buyer"],
++  ["BusinessDeveloper", "تطوير أعمال", "Business Developer"],
++] as const;
++
++async function main() {
++  if (!APPLY) {
++    console.log("DRY_RUN ttcrm_rbac_v1");
++    console.log("Would create TAS-parity RBAC tables:");
++    console.log("- ttcrm_rbac_roles");
++    console.log("- ttcrm_rbac_role_permissions");
++    console.log("- ttcrm_rbac_user_roles");
++    console.log("- ttcrm_rbac_audit_log");
++    console.log(`Would seed ${SYSTEM_ROLES.length} existing TTCRM roles as system roles.`);
++    console.log("No current permission behavior is changed in Phase 1.");
++    console.log("Re-run with --apply to execute.");
++    return;
++  }
++
++  const db = await getDb();
++  if (!db) throw new Error("DATABASE_URL is not configured or database is unavailable");
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS ttcrm_rbac_roles (
++      id INT NOT NULL AUTO_INCREMENT,
++      role_key VARCHAR(128) NOT NULL,
++      name_ar VARCHAR(255) NULL,
++      name_en VARCHAR(255) NOT NULL,
++      description TEXT NULL,
++      is_system TINYINT NOT NULL DEFAULT 0,
++      is_active TINYINT NOT NULL DEFAULT 1,
++      created_by INT NULL,
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++      PRIMARY KEY (id),
++      UNIQUE KEY uq_ttcrm_rbac_roles_key (role_key)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
++  `));
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS ttcrm_rbac_role_permissions (
++      id INT NOT NULL AUTO_INCREMENT,
++      role_id INT NOT NULL,
++      module_key VARCHAR(128) NOT NULL,
++      can_view TINYINT NOT NULL DEFAULT 0,
++      can_create TINYINT NOT NULL DEFAULT 0,
++      can_edit TINYINT NOT NULL DEFAULT 0,
++      can_delete TINYINT NOT NULL DEFAULT 0,
++      can_export TINYINT NOT NULL DEFAULT 0,
++      can_approve TINYINT NOT NULL DEFAULT 0,
++      can_assign TINYINT NOT NULL DEFAULT 0,
++      data_scope ENUM('own','assigned','team','branch','all') NOT NULL DEFAULT 'own',
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
++      PRIMARY KEY (id),
++      UNIQUE KEY uq_ttcrm_rbac_role_module (role_id, module_key),
++      KEY idx_ttcrm_rbac_permission_role (role_id)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
++  `));
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS ttcrm_rbac_user_roles (
++      id INT NOT NULL AUTO_INCREMENT,
++      user_id INT NOT NULL,
++      role_id INT NOT NULL,
++      is_primary TINYINT NOT NULL DEFAULT 1,
++      assigned_by INT NULL,
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      PRIMARY KEY (id),
++      UNIQUE KEY uq_ttcrm_rbac_user_role (user_id, role_id),
++      KEY idx_ttcrm_rbac_user_primary (user_id, is_primary)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
++  `));
++
++  await db.execute(sql.raw(`
++    CREATE TABLE IF NOT EXISTS ttcrm_rbac_audit_log (
++      id BIGINT NOT NULL AUTO_INCREMENT,
++      actor_user_id INT NOT NULL,
++      action VARCHAR(64) NOT NULL,
++      target_type VARCHAR(64) NOT NULL,
++      target_id VARCHAR(128) NULL,
++      before_json JSON NULL,
++      after_json JSON NULL,
++      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
++      PRIMARY KEY (id),
++      KEY idx_ttcrm_rbac_audit_actor (actor_user_id, created_at),
++      KEY idx_ttcrm_rbac_audit_target (target_type, target_id)
++    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
++  `));
++
++  for (const [roleKey, nameAr, nameEn] of SYSTEM_ROLES) {
++    await db.execute(sql`
++      INSERT INTO ttcrm_rbac_roles (role_key, name_ar, name_en, is_system)
++      VALUES (${roleKey}, ${nameAr}, ${nameEn}, 1)
++      ON DUPLICATE KEY UPDATE
++        name_ar = VALUES(name_ar),
++        name_en = VALUES(name_en),
++        is_system = 1
++    `);
++  }
++
++  const tableResult = await db.execute(sql`
++    SELECT COUNT(*) AS tableCount
++    FROM information_schema.tables
++    WHERE table_schema = DATABASE()
++      AND table_name IN (
++        'ttcrm_rbac_roles',
++        'ttcrm_rbac_role_permissions',
++        'ttcrm_rbac_user_roles',
++        'ttcrm_rbac_audit_log'
++      )
++  `);
++  const tableCount = Number((((tableResult as any)[0] ?? []) as any[])[0]?.tableCount ?? 0);
++  if (tableCount !== 4) throw new Error(`Expected 4 RBAC tables, found ${tableCount}`);
++
++  const roleResult = await db.execute(sql`SELECT COUNT(*) AS roleCount FROM ttcrm_rbac_roles WHERE is_system = 1`);
++  const roleCount = Number((((roleResult as any)[0] ?? []) as any[])[0]?.roleCount ?? 0);
++  if (roleCount < SYSTEM_ROLES.length) {
++    throw new Error(`Expected at least ${SYSTEM_ROLES.length} system roles, found ${roleCount}`);
++  }
++
++  console.log("TTCRM_RBAC_V1_MIGRATION_OK");
++}
++
++main().catch((error) => {
++  console.error("TTCRM_RBAC_V1_MIGRATION_FAILED", error);
++  process.exit(1);
++});
+diff --git a/scripts/verify-ttcrm-rbac-v1.ts b/scripts/verify-ttcrm-rbac-v1.ts
+new file mode 100644
+--- /dev/null
++++ b/scripts/verify-ttcrm-rbac-v1.ts
+@@ -0,0 +1,70 @@
++import "dotenv/config";
++import { sql } from "drizzle-orm";
++import { getDb } from "../server/db";
++
++const EXPECTED_TABLES = [
++  "ttcrm_rbac_roles",
++  "ttcrm_rbac_role_permissions",
++  "ttcrm_rbac_user_roles",
++  "ttcrm_rbac_audit_log",
++] as const;
++
++const EXPECTED_ROLES = [
++  "Admin",
++  "SalesManager",
++  "SalesAgent",
++  "SalesFinanceAccounting",
++  "AccountManager",
++  "AccountManagerLead",
++  "ServiceAdvisor",
++  "PartsAgent",
++  "CrmFollowUp",
++  "Viewer",
++  "MediaBuyer",
++  "BusinessDeveloper",
++] as const;
++
++async function main() {
++  const db = await getDb();
++  if (!db) throw new Error("DATABASE_URL is not configured or database is unavailable");
++
++  const tableResult = await db.execute(sql`
++    SELECT table_name AS tableName
++    FROM information_schema.tables
++    WHERE table_schema = DATABASE()
++      AND table_name IN (
++        'ttcrm_rbac_roles',
++        'ttcrm_rbac_role_permissions',
++        'ttcrm_rbac_user_roles',
++        'ttcrm_rbac_audit_log'
++      )
++  `);
++  const tableNames = new Set((((tableResult as any)[0] ?? []) as any[]).map((row) => String(row.tableName)));
++  const missingTables = EXPECTED_TABLES.filter((table) => !tableNames.has(table));
++  if (missingTables.length) throw new Error(`Missing RBAC tables: ${missingTables.join(", ")}`);
++
++  const roleResult = await db.execute(sql`
++    SELECT role_key AS roleKey, is_system AS isSystem
++    FROM ttcrm_rbac_roles
++    WHERE is_active = 1
++  `);
++  const roleRows = ((roleResult as any)[0] ?? []) as any[];
++  const systemRoles = new Set(
++    roleRows.filter((row) => Number(row.isSystem) === 1).map((row) => String(row.roleKey)),
++  );
++  const missingRoles = EXPECTED_ROLES.filter((role) => !systemRoles.has(role));
++  if (missingRoles.length) throw new Error(`Missing RBAC system roles: ${missingRoles.join(", ")}`);
++
++  const permissionColumnsResult = await db.execute(sql`
++    SELECT column_name AS columnName
++    FROM information_schema.columns
++    WHERE table_schema = DATABASE()
++      AND table_name = 'ttcrm_rbac_role_permissions'
++  `);
++  const permissionColumns = new Set(
++    (((permissionColumnsResult as any)[0] ?? []) as any[]).map((row) => String(row.columnName)),
++  );
++  for (const column of ["can_view", "can_create", "can_edit", "can_delete", "can_export", "can_approve", "can_assign", "data_scope"]) {
++    if (!permissionColumns.has(column)) throw new Error(`Missing RBAC permission column: ${column}`);
++  }
++
++  console.log("TTCRM_RBAC_V1_VERIFY_OK");
++}
++
++main().catch((error) => {
++  console.error("TTCRM_RBAC_V1_VERIFY_FAILED", error);
++  process.exit(1);
++});
