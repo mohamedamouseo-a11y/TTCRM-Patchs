@@ -1,0 +1,19 @@
+diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
+--- a/client/src/pages/AdminSettings.tsx
++++ b/client/src/pages/AdminSettings.tsx
+@@ -503,7 +503,6 @@ export default function AdminSettings() {
+             <TabsTrigger value="preferences" className="gap-2 rounded-xl px-3 py-2 text-xs font-medium transition-all data-[state=active]:shadow-md data-[state=active]:font-semibold">
+               <SlidersHorizontal size={13} />{isRTL ? "التفضيلات" : "Preferences"}
+             </TabsTrigger>
+-            {isAdmin && <TabsTrigger value="rolePermissions" className="gap-2 rounded-xl px-3 py-2 text-xs font-medium transition-all data-[state=active]:shadow-md data-[state=active]:font-semibold"><ShieldCheck size={13} />{isRTL ? "صلاحيات الأدوار" : "Role Permissions"}</TabsTrigger>}
+             {isAdmin && <TabsTrigger value="roleAccess" className="gap-2 rounded-xl px-3 py-2 text-xs font-medium transition-all data-[state=active]:shadow-md data-[state=active]:font-semibold">
+               <Shield size={13} />{isRTL ? "الأدوار والصلاحيات" : "Roles & Permissions"}
+             </TabsTrigger>}
+@@ -646,7 +645,6 @@ export default function AdminSettings() {
+           </TabsContent>}
+ 
+           {/* ── Users Tab ── */}
+-          {isAdmin && <TabsContent value="rolePermissions" className="mt-6"><RolePermissionsMatrix isRTL={isRTL} /></TabsContent>}
+           {isAdmin && <TabsContent value="users" className="mt-4">
+             <Card>
+               <CardHeader className="flex flex-row items-center justify-between pb-3">
