@@ -44,7 +44,16 @@ diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
  function isKnownModule(value: unknown): value is TtcrmRbacModule {
    return TTCRM_RBAC_MODULES.includes(String(value) as TtcrmRbacModule);
  }
-@@ -100,11 +136,12 @@
+@@ -54,7 +90,7 @@
+ 
+ export async function getExplicitTtcrmRoleMatrix(roleKey: string): Promise<TtcrmPermissionMatrix | null> {
+   const db = await getDb();
+-  if (!db) return null;
++  if (!db) throw failClosedRbacError("permission lookup");
+ 
+   try {
+     const roleResult = await db.execute(sql`
+@@ -100,18 +136,19 @@
      }
      return matrix;
    } catch (error) {
@@ -62,6 +71,14 @@ diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
    }
  }
  
+ export async function resolveEffectiveTtcrmRoleKey(user: { id: number; role?: string | null }): Promise<string> {
+   const fallbackRoleKey = normalizeUserRole(user.role);
+   const db = await getDb();
+-  if (!db) return fallbackRoleKey;
++  if (!db) throw failClosedRbacError("role lookup");
+ 
+   try {
+     const result = await db.execute(sql`
 @@ -124,9 +161,13 @@
      `);
      const assignedRoleKey = rowsOf(result)[0]?.roleKey;
@@ -89,7 +106,7 @@ diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
 +  if (!db) {
 +    return {
 +      schemaReady: false,
-+      migrationFallbackActive: true,
++      migrationFallbackActive: false,
 +      failClosedOnUnexpectedErrors: true,
 +      reason: "database-unavailable" as const,
 +      rolesCount: 0,
