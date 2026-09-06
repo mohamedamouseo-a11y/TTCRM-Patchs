@@ -1,0 +1,90 @@
+diff --git a/server/_core/trpc.ts b/server/_core/trpc.ts
+--- a/server/_core/trpc.ts
++++ b/server/_core/trpc.ts
+@@ -393,9 +393,14 @@ export const rbacProcedure = (module: TtcrmRbacModule, action: TtcrmRbacAction) =>
+   protectedProcedure.use(
+     t.middleware(async (opts) => {
+       const { ctx, next } = opts;
+-      if (!ctx.user || !(await hasEffectiveTtcrmPermission(ctx.user, module, action))) {
+-        throw new TRPCError({ code: "FORBIDDEN", message: `Forbidden: Missing required permission: ${module}.${action}` });
++      if (!ctx.user) {
++        throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+       }
++
++      const dataScope = await requireEffectiveTtcrmPermission(ctx.user, module, action);
++      const rawInput = await rawProcedureInput(opts);
++      await enforceTtcrmRequestScope(ctx.user.id, dataScope, rawInput);
++
+       return next({ ctx });
+     })
+   );
+diff --git a/server/routers.ts b/server/routers.ts
+--- a/server/routers.ts
++++ b/server/routers.ts
+@@ -602,16 +602,6 @@ const notMediaBuyerProcedure = protectedProcedure.use(({ ctx, next }) => {
+   return next({ ctx });
+ });
+ 
+-const mediaBuyerOrAdminProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isAdminRole(ctx.user.role) || isMediaBuyerRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Only Admin or Media Buyer can manage campaigns" });
+-  }
+-  return next({ ctx });
+-});
++const mediaBuyerOrAdminProcedure = permissionProcedure("marketing.manage");
+ 
+-const clientOpsProcedure = permissionProcedure("accounts.view").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "AccountManager", "AccountManagerLead"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Client operations access required" });
+-  }
+-  return next({ ctx });
+-});
++const clientOpsProcedure = permissionProcedure("accounts.view");
+@@ -746,30 +734,10 @@ async function readEmaarAuditRow(table: any, id: number) {
+   return row ?? null;
+ }
+ 
+-const salesReadProcedure = permissionProcedure("sales.view").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || isMediaBuyerRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer", "AccountManager", "AccountManagerLead"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Sales workspace access required" });
+-  }
+-  return next({ ctx });
+-});
++const salesReadProcedure = permissionProcedure("sales.view");
+ 
+-const salesEditProcedure = permissionProcedure("sales.edit").use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Sales edit access required" });
+-  }
+-  return next({ ctx });
+-});
++const salesEditProcedure = permissionProcedure("sales.edit");
+ 
+-const automotiveReadProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp", "Viewer"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Automotive workspace access required" });
+-  }
+-  return next({ ctx });
+-});
++const automotiveReadProcedure = permissionProcedure("sales.view");
+ 
+-const automotiveWriteProcedure = protectedProcedure.use(({ ctx, next }) => {
+-  if (!(isManagerRole(ctx.user.role) || isSalesAgentRole(ctx.user.role) || ["ServiceAdvisor", "PartsAgent", "CrmFollowUp"].includes(String(ctx.user.role)))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Automotive edit access required" });
+-  }
+-  return next({ ctx });
+-});
++const automotiveWriteProcedure = permissionProcedure("sales.edit");
+@@ -981,11 +951,6 @@ function buildSupportRequestCode(): string {
+ }
+ 
+ 
+-const marketingCenterProcedure = permissionProcedure("marketing.view").use(({ ctx, next }) => {
+-  if (!(isAdminRole(ctx.user.role) || isMediaBuyerRole(ctx.user.role) || isManagerRole(ctx.user.role))) {
+-    throw new TRPCError({ code: "FORBIDDEN", message: "Marketing Center access required" });
+-  }
+-  return next({ ctx });
+-});
++const marketingCenterProcedure = permissionProcedure("marketing.view");
+ 
+ function getPublicBaseUrl(req: any): string {
