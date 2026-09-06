@@ -1,20 +1,28 @@
 diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
 --- a/client/src/pages/AdminSettings.tsx
 +++ b/client/src/pages/AdminSettings.tsx
-@@ -1,3 +1,4 @@
+@@ -39,6 +39,7 @@
+ import DashboardAuditTab from "@/components/DashboardAuditTab";
+ import DynamicServicesTab from "@/components/DynamicServicesTab";
  import FinanceSettingsTab from "@/components/FinanceSettingsTab";
  import RolePermissionsStudio from "@/components/RolePermissionsStudio";
 +import RbacUserRoleManager from "@/components/RbacUserRoleManager";
  import { useState, useEffect } from "react";
-@@ -14,5 +15,8 @@ function X(){
+ import { useLocation } from "wouter";
+@@ -632,10 +633,13 @@
+           {/* ── Roles & Permissions Studio ── */}
+           {isAdmin && <TabsContent value="roleAccess" className="mt-4">
+             <RolePermissionsStudio
+               users={(users ?? []) as any[]}
+               isRTL={isRTL}
+               currentUserId={user?.id}
+               assigning={updateUser.isPending}
                onAssignRole={({ id, role }) => updateUser.mutate({ id, role } as any)}
              />
 +            <div className="mt-4">
 +              <RbacUserRoleManager isRTL={isRTL} currentUserId={user?.id} />
 +            </div>
            </TabsContent>}
-   </>
- }
 diff --git a/client/src/components/RbacUserRoleManager.tsx b/client/src/components/RbacUserRoleManager.tsx
 new file mode 100644
 --- /dev/null
