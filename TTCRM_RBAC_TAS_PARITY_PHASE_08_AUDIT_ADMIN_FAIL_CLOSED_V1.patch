@@ -214,7 +214,7 @@ diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
      `);
      return {
        success: true as const,
- diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
+diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
 --- a/server/rbacRouter.ts
 +++ b/server/rbacRouter.ts
 @@ -6,6 +6,8 @@
