@@ -1,0 +1,387 @@
+diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
+--- a/server/services/rbacService.ts
++++ b/server/services/rbacService.ts
+@@ -28,6 +28,28 @@ function defaultMatrixForRole(roleKey: string): TtcrmPermissionMatrix {
+   return DEFAULT_TTCRM_ROLE_MATRIX[roleKey] ?? {};
+ }
+ 
++export type TtcrmRolePermissionInput = {
++  module: TtcrmRbacModule;
++  view: boolean;
++  create: boolean;
++  edit: boolean;
++  delete: boolean;
++  export: boolean;
++  approve: boolean;
++  assign: boolean;
++  dataScope: TtcrmDataScope;
++};
++
++export type TtcrmRoleSaveInput = {
++  roleKey: string;
++  nameAr?: string | null;
++  nameEn: string;
++  description?: string | null;
++  permissions: TtcrmRolePermissionInput[];
++};
++
++function rowsOf(result: any): any[] {
++  return ((result as any)?.[0] ?? []) as any[];
++}
++
+ export async function getExplicitTtcrmRoleMatrix(roleKey: string): Promise<TtcrmPermissionMatrix | null> {
+   const db = await getDb();
+   if (!db) return null;
+@@ -87,8 +109,31 @@ export async function getExplicitTtcrmRoleMatrix(roleKey: string): Promise<Ttcr
+   }
+ }
+ 
++export async function resolveEffectiveTtcrmRoleKey(user: { id: number; role?: string | null }): Promise<string> {
++  const fallbackRoleKey = normalizeUserRole(user.role);
++  const db = await getDb();
++  if (!db) return fallbackRoleKey;
++
++  try {
++    const result = await db.execute(sql`
++      SELECT r.role_key AS roleKey
++      FROM ttcrm_rbac_user_roles ur
++      INNER JOIN ttcrm_rbac_roles r ON r.id = ur.role_id
++      WHERE ur.user_id = ${user.id} AND ur.is_primary = 1
++      ORDER BY ur.id DESC
++      LIMIT 1
++    `);
++    const assignedRoleKey = rowsOf(result)[0]?.roleKey;
++    return assignedRoleKey ? String(assignedRoleKey) : fallbackRoleKey;
++  } catch {
++    // Phase 1 migration may not have been applied yet. Preserve legacy role behavior.
++    return fallbackRoleKey;
++  }
++}
++
+ export async function getEffectiveTtcrmPermissions(user: { id: number; role?: string | null }): Promise<TtcrmPermissionMatrix> {
+-  const roleKey = normalizeUserRole(user.role);
++  const roleKey = await resolveEffectiveTtcrmRoleKey(user);
+   if (roleKey === "Admin") return DEFAULT_TTCRM_ROLE_MATRIX.Admin;
+ 
+   const explicit = await getExplicitTtcrmRoleMatrix(roleKey);
+@@ -124,3 +169,207 @@ export async function requireEffectiveTtcrmPermission(
+   }
+   return scopeFromTtcrmMatrix(matrix, module);
+ }
++
++export async function listTtcrmRbacRoles() {
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++
++  const result = await db.execute(sql`
++    SELECT id,
++           role_key AS roleKey,
++           name_ar AS nameAr,
++           name_en AS nameEn,
++           description,
++           is_system AS isSystem,
++           is_active AS isActive
++    FROM ttcrm_rbac_roles
++    WHERE is_active = 1
++    ORDER BY is_system DESC, name_en ASC, role_key ASC
++  `);
++
++  const roles = rowsOf(result);
++  return Promise.all(roles.map(async (role) => {
++    const roleKey = String(role.roleKey);
++    const explicit = await getExplicitTtcrmRoleMatrix(roleKey);
++    return {
++      id: Number(role.id),
++      roleKey,
++      nameAr: role.nameAr ?? null,
++      nameEn: String(role.nameEn ?? roleKey),
++      description: role.description ?? null,
++      isSystem: Boolean(role.isSystem),
++      isActive: Boolean(role.isActive),
++      locked: roleKey === "Admin",
++      permissions: explicit ?? defaultMatrixForRole(roleKey),
++    };
++  }));
++}
++
++export async function listTtcrmRbacUsers() {
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++
++  const result = await db.execute(sql`
++    SELECT u.id,
++           u.name,
++           u.email,
++           u.role AS legacyRole,
++           u.teamId,
++           r.role_key AS assignedRoleKey,
++           r.name_ar AS assignedRoleNameAr,
++           r.name_en AS assignedRoleNameEn,
++           r.is_active AS assignedRoleActive
++    FROM users u
++    LEFT JOIN ttcrm_rbac_user_roles ur
++      ON ur.user_id = u.id AND ur.is_primary = 1
++    LEFT JOIN ttcrm_rbac_roles r
++      ON r.id = ur.role_id
++    WHERE u.deletedAt IS NULL
++    ORDER BY u.name ASC, u.email ASC, u.id ASC
++  `);
++
++  return rowsOf(result).map((row) => ({
++    id: Number(row.id),
++    name: row.name ?? null,
++    email: row.email ?? null,
++    teamId: row.teamId == null ? null : Number(row.teamId),
++    legacyRole: normalizeUserRole(row.legacyRole),
++    roleKey: row.assignedRoleKey ? String(row.assignedRoleKey) : normalizeUserRole(row.legacyRole),
++    roleNameAr: row.assignedRoleNameAr ?? null,
++    roleNameEn: row.assignedRoleNameEn ?? null,
++    roleActive: row.assignedRoleKey ? Boolean(row.assignedRoleActive) : true,
++  }));
++}
++
++export async function saveTtcrmRbacRole(actorUserId: number, input: TtcrmRoleSaveInput) {
++  if (input.roleKey === "Admin") {
++    throw new TRPCError({ code: "FORBIDDEN", message: "Admin is a protected system role" });
++  }
++
++  const seenModules = new Set<string>();
++  for (const permission of input.permissions) {
++    if (seenModules.has(permission.module)) {
++      throw new TRPCError({ code: "BAD_REQUEST", message: `Duplicate permission module: ${permission.module}` });
++    }
++    seenModules.add(permission.module);
++  }
++
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++
++  return db.transaction(async (tx) => {
++    const existingResult = await tx.execute(sql`
++      SELECT id, role_key AS roleKey, name_ar AS nameAr, name_en AS nameEn,
++             description, is_system AS isSystem, is_active AS isActive
++      FROM ttcrm_rbac_roles
++      WHERE role_key = ${input.roleKey}
++      LIMIT 1
++    `);
++    const before = rowsOf(existingResult)[0] ?? null;
++
++    await tx.execute(sql`
++      INSERT INTO ttcrm_rbac_roles
++        (role_key, name_ar, name_en, description, is_system, is_active, created_by)
++      VALUES
++        (${input.roleKey}, ${input.nameAr ?? null}, ${input.nameEn}, ${input.description ?? null}, 0, 1, ${actorUserId})
++      ON DUPLICATE KEY UPDATE
++        name_ar = VALUES(name_ar),
++        name_en = VALUES(name_en),
++        description = VALUES(description),
++        is_active = 1
++    `);
++
++    const roleResult = await tx.execute(sql`
++      SELECT id, is_system AS isSystem
++      FROM ttcrm_rbac_roles
++      WHERE role_key = ${input.roleKey}
++      LIMIT 1
++    `);
++    const role = rowsOf(roleResult)[0];
++    if (!role) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Role save failed" });
++    const roleId = Number(role.id);
++
++    await tx.execute(sql`DELETE FROM ttcrm_rbac_role_permissions WHERE role_id = ${roleId}`);
++    for (const permission of input.permissions) {
++      await tx.execute(sql`
++        INSERT INTO ttcrm_rbac_role_permissions
++          (role_id, module_key, can_view, can_create, can_edit, can_delete, can_export, can_approve, can_assign, data_scope)
++        VALUES
++          (${roleId}, ${permission.module}, ${Number(permission.view)}, ${Number(permission.create)},
++           ${Number(permission.edit)}, ${Number(permission.delete)}, ${Number(permission.export)},
++           ${Number(permission.approve)}, ${Number(permission.assign)}, ${permission.dataScope})
++      `);
++    }
++
++    await tx.execute(sql`
++      INSERT INTO ttcrm_rbac_audit_log
++        (actor_user_id, action, target_type, target_id, before_json, after_json)
++      VALUES
++        (${actorUserId}, ${before ? "role.update" : "role.create"}, 'role', ${String(roleId)},
++         ${JSON.stringify(before)}, ${JSON.stringify(input)})
++    `);
++
++    return { success: true as const, roleId, roleKey: input.roleKey, isSystem: Boolean(role.isSystem) };
++  });
++}
++
++export async function disableTtcrmRbacRole(actorUserId: number, roleKey: string) {
++  if (roleKey === "Admin") {
++    throw new TRPCError({ code: "FORBIDDEN", message: "Admin is a protected system role" });
++  }
++
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++
++  const roleResult = await db.execute(sql`
++    SELECT id, is_system AS isSystem, is_active AS isActive
++    FROM ttcrm_rbac_roles
++    WHERE role_key = ${roleKey}
++    LIMIT 1
++  `);
++  const role = rowsOf(roleResult)[0];
++  if (!role) throw new TRPCError({ code: "NOT_FOUND", message: "Role not found" });
++  if (Boolean(role.isSystem)) {
++    throw new TRPCError({ code: "FORBIDDEN", message: "System roles cannot be disabled" });
++  }
++
++  await db.transaction(async (tx) => {
++    await tx.execute(sql`UPDATE ttcrm_rbac_roles SET is_active = 0 WHERE id = ${Number(role.id)}`);
++    await tx.execute(sql`
++      INSERT INTO ttcrm_rbac_audit_log (actor_user_id, action, target_type, target_id, before_json)
++      VALUES (${actorUserId}, 'role.delete', 'role', ${String(role.id)}, ${JSON.stringify({ roleKey, isActive: Boolean(role.isActive) })})
++    `);
++  });
++
++  return { success: true as const };
++}
++
++export async function assignTtcrmRbacUserRole(actorUserId: number, userId: number, roleKey: string) {
++  const db = await getDb();
++  if (!db) throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++
++  return db.transaction(async (tx) => {
++    const userResult = await tx.execute(sql`
++      SELECT id, role
++      FROM users
++      WHERE id = ${userId} AND deletedAt IS NULL AND isActive = 1
++      LIMIT 1
++    `);
++    const user = rowsOf(userResult)[0];
++    if (!user) throw new TRPCError({ code: "NOT_FOUND", message: "User not found" });
++
++    const roleResult = await tx.execute(sql`
++      SELECT id, role_key AS roleKey, is_system AS isSystem
++      FROM ttcrm_rbac_roles
++      WHERE role_key = ${roleKey} AND is_active = 1
++      LIMIT 1
++    `);
++    const role = rowsOf(roleResult)[0];
++    if (!role) throw new TRPCError({ code: "NOT_FOUND", message: "Role not found or disabled" });
++
++    const currentLegacyRole = normalizeUserRole(user.role);
++    if (currentLegacyRole === "Admin" && roleKey !== "Admin") {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Admin assignment is protected during RBAC migration" });
++    }
++
++    await tx.execute(sql`UPDATE ttcrm_rbac_user_roles SET is_primary = 0 WHERE user_id = ${userId}`);
++    await tx.execute(sql`
++      INSERT INTO ttcrm_rbac_user_roles (user_id, role_id, is_primary, assigned_by)
++      VALUES (${userId}, ${Number(role.id)}, 1, ${actorUserId})
++      ON DUPLICATE KEY UPDATE
++        is_primary = 1,
++        assigned_by = VALUES(assigned_by)
++    `);
++
++    // Keep the legacy enum synchronized only for system roles. Custom role keys
++    // intentionally live only in ttcrm_rbac_user_roles because users.role is an enum.
++    if (Boolean(role.isSystem)) {
++      await tx.execute(sql`UPDATE users SET role = ${roleKey} WHERE id = ${userId}`);
++    }
++
++    await tx.execute(sql`
++      INSERT INTO ttcrm_rbac_audit_log (actor_user_id, action, target_type, target_id, before_json, after_json)
++      VALUES (${actorUserId}, 'user.role.assign', 'user', ${String(userId)},
++              ${JSON.stringify({ roleKey: currentLegacyRole })}, ${JSON.stringify({ roleKey })})
++    `);
++
++    return {
++      success: true as const,
++      roleKey,
++      legacyRoleSynced: Boolean(role.isSystem),
++    };
++  });
++}
+diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
+--- a/server/rbacRouter.ts
++++ b/server/rbacRouter.ts
+@@ -1,27 +1,76 @@
+-import { protectedProcedure, router } from "./_core/trpc";
+ import { TRPCError } from "@trpc/server";
+-import { normalizeUserRole } from "../shared/permissions";
++import { z } from "zod";
++import { adminProcedure, protectedProcedure, router } from "./_core/trpc";
+ import { TTCRM_DATA_SCOPES, TTCRM_RBAC_ACTIONS, TTCRM_RBAC_MODULES } from "../shared/rbac";
+-import { getEffectiveTtcrmPermissions } from "./services/rbacService";
++import {
++  assignTtcrmRbacUserRole,
++  disableTtcrmRbacRole,
++  getEffectiveTtcrmPermissions,
++  listTtcrmRbacRoles,
++  listTtcrmRbacUsers,
++  resolveEffectiveTtcrmRoleKey,
++  saveTtcrmRbacRole,
++} from "./services/rbacService";
++
++const permissionInput = z.object({
++  module: z.enum(TTCRM_RBAC_MODULES),
++  view: z.boolean(),
++  create: z.boolean(),
++  edit: z.boolean(),
++  delete: z.boolean(),
++  export: z.boolean(),
++  approve: z.boolean(),
++  assign: z.boolean(),
++  dataScope: z.enum(TTCRM_DATA_SCOPES),
++});
++
++const roleKeySchema = z.string()
++  .trim()
++  .min(2)
++  .max(128)
++  .regex(/^[A-Za-z][A-Za-z0-9_-]*$/, "Role key must start with a letter and contain only letters, numbers, _ or -");
+ 
+ export const rbacRouter = router({
+   catalog: protectedProcedure.query(() => ({
+     modules: TTCRM_RBAC_MODULES,
+     actions: TTCRM_RBAC_ACTIONS,
+     dataScopes: TTCRM_DATA_SCOPES,
+   })),
+ 
+   me: protectedProcedure.query(async ({ ctx }) => {
+     const user = ctx.user;
+     if (!user) {
+       throw new TRPCError({ code: "UNAUTHORIZED", message: "Authentication required" });
+     }
+     return {
+-      role: normalizeUserRole(user.role),
++      role: await resolveEffectiveTtcrmRoleKey(user),
+       permissions: await getEffectiveTtcrmPermissions({
+         id: user.id,
+         role: user.role,
+       }),
+     };
+   }),
++
++  listUsers: adminProcedure.query(() => listTtcrmRbacUsers()),
++
++  listRoles: adminProcedure.query(() => listTtcrmRbacRoles()),
++
++  saveRole: adminProcedure
++    .input(z.object({
++      roleKey: roleKeySchema,
++      nameAr: z.string().trim().max(255).optional().nullable(),
++      nameEn: z.string().trim().min(2).max(255),
++      description: z.string().trim().max(2000).optional().nullable(),
++      permissions: z.array(permissionInput).max(TTCRM_RBAC_MODULES.length),
++    }))
++    .mutation(({ ctx, input }) => saveTtcrmRbacRole(ctx.user.id, input)),
++
++  deleteRole: adminProcedure
++    .input(z.object({ roleKey: roleKeySchema }))
++    .mutation(({ ctx, input }) => disableTtcrmRbacRole(ctx.user.id, input.roleKey)),
++
++  assignUserRole: adminProcedure
++    .input(z.object({
++      userId: z.number().int().positive(),
++      roleKey: roleKeySchema,
++    }))
++    .mutation(({ ctx, input }) => assignTtcrmRbacUserRole(ctx.user.id, input.userId, input.roleKey)),
+ });
