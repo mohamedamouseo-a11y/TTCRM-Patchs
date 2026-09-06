@@ -1,0 +1,217 @@
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 12c4448..ed51407 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -1,5 +1,6 @@
+-import { hasRolePermission, AppPermission } from "@/lib/roles";
++import type { AppPermission } from "@/lib/roles";
+ import { useAuth } from "@/_core/hooks/useAuth";
++import { useTtcrmRbac } from "@/lib/ttcrmRbac";
+ import GlobalSearch from "./components/GlobalSearch";
+ import { Toaster } from "@/components/ui/sonner";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+@@ -15,17 +16,19 @@ const BASE_PATH = (import.meta.env.BASE_URL || "/").replace(/\/$/, "");
+ 
+ 
+ function PermissionRoute({ path, permission, component: Component }: { path: string, permission: AppPermission, component: React.ComponentType<any> }) {
+-  const { user, loading } = useAuth();
+-  if (loading) return null;
+-  if (!user || !hasRolePermission(user.role, permission)) {
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  if (authLoading || rbac.isLoading || rbac.isFetching) return null;
++  if (!user || rbac.error || !rbac.canLegacy(permission)) {
+     return <Redirect to="/access-denied" />;
+   }
+   return <Route path={path} component={Component} />;
+ }
+ 
+ function PermissionRedirect({ path, permission, to }: { path: string; permission: AppPermission; to: string }) {
+-  const { user, loading } = useAuth();
+-  if (loading) return null;
+-  if (!user || !hasRolePermission(user.role, permission)) return <Redirect to="/access-denied" />;
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  if (authLoading || rbac.isLoading || rbac.isFetching) return null;
++  if (!user || rbac.error || !rbac.canLegacy(permission)) return <Redirect to="/access-denied" />;
+   return <Route path={path}>{() => <Redirect to={to} />}</Route>;
+ }
+diff --git a/client/src/hooks/usePermissions.ts b/client/src/hooks/usePermissions.ts
+index 3297468..7572588 100644
+--- a/client/src/hooks/usePermissions.ts
++++ b/client/src/hooks/usePermissions.ts
+@@ -1,12 +1,36 @@
+ import { useAuth } from "@/_core/hooks/useAuth";
+-import { hasRolePermission, hasAnyRolePermission, AppPermission } from "@/lib/roles";
++import { useTtcrmRbac } from "@/lib/ttcrmRbac";
++import type { AppPermission } from "@/lib/roles";
++import type { TtcrmRbacAction, TtcrmRbacModule } from "@shared/rbac";
+ 
+ export function usePermission(permission: AppPermission) {
+-  const { user } = useAuth();
+-  return hasRolePermission(user?.role, permission);
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  if (authLoading || rbac.isLoading || rbac.isFetching || rbac.error || !user) return false;
++  return rbac.canLegacy(permission);
+ }
+ 
+ export function useAnyPermission(permissions: readonly AppPermission[]) {
+-  const { user } = useAuth();
+-  return hasAnyRolePermission(user?.role, permissions);
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  if (authLoading || rbac.isLoading || rbac.isFetching || rbac.error || !user) return false;
++  return permissions.some((permission) => rbac.canLegacy(permission));
++}
++
++export function useRbacPermission(module: TtcrmRbacModule, action: TtcrmRbacAction = "view") {
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  if (authLoading || rbac.isLoading || rbac.isFetching || rbac.error || !user) return false;
++  return rbac.can(module, action);
++}
++
++export function useRbacScope(module: TtcrmRbacModule) {
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++  return {
++    scope: rbac.scope(module),
++    loading: authLoading || rbac.isLoading || rbac.isFetching,
++    error: rbac.error ?? null,
++    ready: Boolean(user) && !authLoading && !rbac.isLoading && !rbac.isFetching && !rbac.error,
++  };
+ }
+diff --git a/client/src/lib/ttcrmRbac.ts b/client/src/lib/ttcrmRbac.ts
+new file mode 100644
+index 0000000..b0ca3b9
+--- /dev/null
++++ b/client/src/lib/ttcrmRbac.ts
+@@ -0,0 +1,98 @@
++import { trpc } from "@/lib/trpc";
++import type { AppPermission } from "@shared/permissions";
++import {
++  canFromTtcrmMatrix,
++  scopeFromTtcrmMatrix,
++  type TtcrmDataScope,
++  type TtcrmPermissionMatrix,
++  type TtcrmRbacAction,
++  type TtcrmRbacModule,
++} from "@shared/rbac";
++
++export type LegacyPermissionTarget = {
++  module: TtcrmRbacModule;
++  action: TtcrmRbacAction;
++};
++
++export const LEGACY_PERMISSION_RBAC_MAP: Record<AppPermission, LegacyPermissionTarget> = {
++  "dashboard.view": { module: "dashboard", action: "view" },
++  "inbox.view": { module: "inbox", action: "view" },
++  "inbox.reply": { module: "inbox", action: "edit" },
++  "chat.view": { module: "chat", action: "view" },
++  "chat.reply": { module: "chat", action: "edit" },
++  "sales.view": { module: "sales", action: "view" },
++  "sales.create": { module: "sales", action: "create" },
++  "sales.edit": { module: "sales", action: "edit" },
++  "sales.delete": { module: "sales", action: "delete" },
++  "sales.assign": { module: "sales", action: "assign" },
++  "sales.reports": { module: "sales", action: "export" },
++  "marketing.view": { module: "marketing", action: "view" },
++  "marketing.manage": { module: "marketing", action: "edit" },
++  "emailMarketing.view": { module: "email_marketing", action: "view" },
++  "emailMarketing.manage": { module: "email_marketing", action: "edit" },
++  "accounts.view": { module: "accounts", action: "view" },
++  "accounts.create": { module: "accounts", action: "create" },
++  "accounts.edit": { module: "accounts", action: "edit" },
++  "accounts.delete": { module: "accounts", action: "delete" },
++  "accounts.manage": { module: "accounts", action: "assign" },
++  "finance.view": { module: "finance", action: "view" },
++  "finance.edit": { module: "finance", action: "edit" },
++  "finance.approve": { module: "finance", action: "approve" },
++  "finance.settings": { module: "settings", action: "edit" },
++  "businessDevelopment.view": { module: "business_development", action: "view" },
++  "businessDevelopment.edit": { module: "business_development", action: "edit" },
++  "businessDevelopment.manage": { module: "business_development", action: "assign" },
++  "whatsapp.view": { module: "whatsapp", action: "view" },
++  "whatsapp.reply": { module: "whatsapp", action: "edit" },
++  "whatsapp.manage": { module: "whatsapp", action: "assign" },
++  "import.manage": { module: "import", action: "create" },
++  "trash.view": { module: "trash", action: "view" },
++  "trash.restore": { module: "trash", action: "edit" },
++  "trash.permanentDelete": { module: "trash", action: "delete" },
++  "audit.view": { module: "audit_log", action: "view" },
++  "audit.manage": { module: "audit_log", action: "edit" },
++  "settings.view": { module: "settings", action: "view" },
++  "settings.manage": { module: "settings", action: "edit" },
++  "users.view": { module: "users", action: "view" },
++  "users.manage": { module: "users", action: "edit" },
++  "support.view": { module: "support", action: "view" },
++  "support.manage": { module: "support", action: "edit" },
++};
++
++export function legacyPermissionTarget(permission: AppPermission): LegacyPermissionTarget {
++  return LEGACY_PERMISSION_RBAC_MAP[permission];
++}
++
++export function canLegacyPermissionFromMatrix(
++  matrix: TtcrmPermissionMatrix | null | undefined,
++  permission: AppPermission,
++): boolean {
++  const target = legacyPermissionTarget(permission);
++  return canFromTtcrmMatrix(matrix ?? {}, target.module, target.action);
++}
++
++export function useTtcrmRbac(enabled = true) {
++  const query = trpc.rbac.me.useQuery(undefined, {
++    enabled,
++    staleTime: 30_000,
++    refetchOnWindowFocus: false,
++    retry: false,
++  });
++
++  const permissions = (query.data?.permissions ?? {}) as TtcrmPermissionMatrix;
++  const can = (module: TtcrmRbacModule, action: TtcrmRbacAction = "view") =>
++    canFromTtcrmMatrix(permissions, module, action);
++  const canLegacy = (permission: AppPermission) =>
++    canLegacyPermissionFromMatrix(permissions, permission);
++  const scope = (module: TtcrmRbacModule): TtcrmDataScope =>
++    scopeFromTtcrmMatrix(permissions, module);
++
++  return {
++    ...query,
++    role: query.data?.role ?? null,
++    permissions,
++    can,
++    canLegacy,
++    scope,
++  };
++}
+diff --git a/client/src/components/TTCRMPermissionGuard.tsx b/client/src/components/TTCRMPermissionGuard.tsx
+new file mode 100644
+index 0000000..832e53f
+--- /dev/null
++++ b/client/src/components/TTCRMPermissionGuard.tsx
+@@ -0,0 +1,23 @@
++import type { ReactNode } from "react";
++import { useAuth } from "@/_core/hooks/useAuth";
++import { useTtcrmRbac } from "@/lib/ttcrmRbac";
++import type { TtcrmRbacAction, TtcrmRbacModule } from "@shared/rbac";
++
++export default function TTCRMPermissionGuard({
++  module,
++  action = "view",
++  children,
++  fallback = null,
++}: {
++  module: TtcrmRbacModule;
++  action?: TtcrmRbacAction;
++  children: ReactNode;
++  fallback?: ReactNode;
++}) {
++  const { user, loading: authLoading } = useAuth();
++  const rbac = useTtcrmRbac(Boolean(user) && !authLoading);
++
++  if (authLoading || rbac.isLoading || rbac.isFetching) return null;
++  if (!user || rbac.error || !rbac.can(module, action)) return <>{fallback}</>;
++  return <>{children}</>;
++}
