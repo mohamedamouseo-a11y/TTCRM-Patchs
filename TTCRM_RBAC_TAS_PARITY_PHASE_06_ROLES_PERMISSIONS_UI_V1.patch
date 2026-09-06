@@ -1,0 +1,713 @@
+diff --git a/client/src/pages/AdminSettings.tsx b/client/src/pages/AdminSettings.tsx
+--- a/client/src/pages/AdminSettings.tsx
++++ b/client/src/pages/AdminSettings.tsx
+@@ -41,7 +41,7 @@ import WhatsAppGatewaySettingsTab from "@/components/WhatsAppGatewaySettingsTab";
+ import DashboardAuditTab from "@/components/DashboardAuditTab";
+ import DynamicServicesTab from "@/components/DynamicServicesTab";
+ import FinanceSettingsTab from "@/components/FinanceSettingsTab";
+-import RolePermissionsStudio from "@/components/RolePermissionsStudio";
++import RolePermissionsStudio from "@/components/DynamicRolePermissionsStudio";
+ import { useState, useEffect } from "react";
+ import { useLocation } from "wouter";
+ import { toast } from "sonner";
+diff --git a/client/src/components/DynamicRolePermissionsStudio.tsx b/client/src/components/DynamicRolePermissionsStudio.tsx
+new file mode 100644
+--- /dev/null
++++ b/client/src/components/DynamicRolePermissionsStudio.tsx
+@@ -0,0 +1,696 @@
++import { Badge } from "@/components/ui/badge";
++import { Button } from "@/components/ui/button";
++import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
++import { Input } from "@/components/ui/input";
++import { Label } from "@/components/ui/label";
++import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
++import { trpc } from "@/lib/trpc";
++import type { AppUserRole } from "@/lib/roles";
++import {
++  TTCRM_DATA_SCOPES,
++  TTCRM_RBAC_ACTIONS,
++  TTCRM_RBAC_MODULES,
++  type TtcrmDataScope,
++  type TtcrmPermissionGrant,
++  type TtcrmPermissionMatrix,
++  type TtcrmRbacAction,
++  type TtcrmRbacModule,
++} from "@shared/rbac";
++import {
++  AlertTriangle,
++  CheckCircle2,
++  LockKeyhole,
++  Plus,
++  RefreshCw,
++  Save,
++  Search,
++  ShieldCheck,
++  Trash2,
++} from "lucide-react";
++import { useEffect, useMemo, useState } from "react";
++
++type UserLike = { id: number; name?: string | null; email?: string | null; role?: string | null };
++type Props = {
++  users?: UserLike[];
++  isRTL: boolean;
++  currentUserId?: number | null;
++  onAssignRole?: (payload: { id: number; role: AppUserRole }) => void;
++  assigning?: boolean;
++};
++
++type RoleDraft = {
++  roleKey: string;
++  nameAr: string;
++  nameEn: string;
++  description: string;
++  isSystem: boolean;
++  locked: boolean;
++  isNew: boolean;
++  permissions: Record<TtcrmRbacModule, TtcrmPermissionGrant>;
++};
++
++const MODULE_LABELS: Record<TtcrmRbacModule, { ar: string; en: string }> = {
++  dashboard: { ar: "لوحة التحكم", en: "Dashboard" },
++  inbox: { ar: "صندوق الوارد", en: "Inbox" },
++  chat: { ar: "المحادثات", en: "Chat" },
++  sales: { ar: "المبيعات", en: "Sales" },
++  marketing: { ar: "التسويق", en: "Marketing" },
++  email_marketing: { ar: "التسويق البريدي", en: "Email Marketing" },
++  accounts: { ar: "إدارة الحسابات", en: "Account Management" },
++  finance: { ar: "المالية", en: "Finance" },
++  business_development: { ar: "تطوير الأعمال", en: "Business Development" },
++  whatsapp: { ar: "واتساب", en: "WhatsApp" },
++  import: { ar: "استيراد البيانات", en: "Data Import" },
++  trash: { ar: "سلة المحذوفات", en: "Trash" },
++  audit_log: { ar: "سجل التدقيق", en: "Audit Log" },
++  settings: { ar: "الإعدادات", en: "Settings" },
++  users: { ar: "المستخدمون", en: "Users" },
++  support: { ar: "مركز الدعم", en: "Support" },
++};
++
++const ACTION_LABELS: Record<TtcrmRbacAction, { ar: string; en: string }> = {
++  view: { ar: "عرض", en: "View" },
++  create: { ar: "إنشاء", en: "Create" },
++  edit: { ar: "تعديل", en: "Edit" },
++  delete: { ar: "حذف", en: "Delete" },
++  export: { ar: "تصدير", en: "Export" },
++  approve: { ar: "اعتماد", en: "Approve" },
++  assign: { ar: "تعيين", en: "Assign" },
++};
++
++const SCOPE_LABELS: Record<TtcrmDataScope, { ar: string; en: string }> = {
++  own: { ar: "بياناتي", en: "Own" },
++  assigned: { ar: "المسند لي", en: "Assigned" },
++  team: { ar: "الفريق", en: "Team" },
++  branch: { ar: "الفرع", en: "Branch" },
++  all: { ar: "كل البيانات", en: "All" },
++};
++
++function blankGrant(): TtcrmPermissionGrant {
++  return {
++    view: false,
++    create: false,
++    edit: false,
++    delete: false,
++    export: false,
++    approve: false,
++    assign: false,
++    dataScope: "own",
++  };
++}
++
++function completeMatrix(matrix?: TtcrmPermissionMatrix | null): Record<TtcrmRbacModule, TtcrmPermissionGrant> {
++  return Object.fromEntries(
++    TTCRM_RBAC_MODULES.map((module) => [
++      module,
++      {
++        ...blankGrant(),
++        ...(matrix?.[module] ?? {}),
++      },
++    ]),
++  ) as Record<TtcrmRbacModule, TtcrmPermissionGrant>;
++}
++
++function roleToDraft(role: any): RoleDraft {
++  return {
++    roleKey: String(role.roleKey),
++    nameAr: String(role.nameAr ?? ""),
++    nameEn: String(role.nameEn ?? role.roleKey ?? ""),
++    description: String(role.description ?? ""),
++    isSystem: Boolean(role.isSystem),
++    locked: Boolean(role.locked) || String(role.roleKey) === "Admin",
++    isNew: false,
++    permissions: completeMatrix(role.permissions as TtcrmPermissionMatrix),
++  };
++}
++
++function newRoleDraft(): RoleDraft {
++  return {
++    roleKey: "",
++    nameAr: "",
++    nameEn: "",
++    description: "",
++    isSystem: false,
++    locked: false,
++    isNew: true,
++    permissions: completeMatrix(),
++  };
++}
++
++export default function DynamicRolePermissionsStudio({ isRTL }: Props) {
++  const utils = trpc.useUtils();
++  const rolesQuery = trpc.rbac.listRoles.useQuery(undefined, {
++    retry: false,
++    refetchOnWindowFocus: false,
++  });
++  const catalogQuery = trpc.rbac.catalog.useQuery(undefined, {
++    retry: false,
++    refetchOnWindowFocus: false,
++  });
++  const saveRoleMutation = trpc.rbac.saveRole.useMutation();
++  const deleteRoleMutation = trpc.rbac.deleteRole.useMutation();
++
++  const [selectedRoleKey, setSelectedRoleKey] = useState<string | null>(null);
++  const [draft, setDraft] = useState<RoleDraft | null>(null);
++  const [roleSearch, setRoleSearch] = useState("");
++  const [moduleSearch, setModuleSearch] = useState("");
++  const [notice, setNotice] = useState<string | null>(null);
++
++  const roles = rolesQuery.data ?? [];
++  const modules = (catalogQuery.data?.modules ?? TTCRM_RBAC_MODULES) as readonly TtcrmRbacModule[];
++  const actions = (catalogQuery.data?.actions ?? TTCRM_RBAC_ACTIONS) as readonly TtcrmRbacAction[];
++  const dataScopes = (catalogQuery.data?.dataScopes ?? TTCRM_DATA_SCOPES) as readonly TtcrmDataScope[];
++
++  useEffect(() => {
++    if (selectedRoleKey === "__new__") return;
++    if (!roles.length) {
++      setDraft(null);
++      return;
++    }
++    const role =
++      roles.find((item) => String(item.roleKey) === selectedRoleKey) ??
++      roles.find((item) => String(item.roleKey) === "Admin") ??
++      roles[0];
++    if (!role) return;
++    if (String(role.roleKey) !== selectedRoleKey) setSelectedRoleKey(String(role.roleKey));
++    setDraft(roleToDraft(role));
++  }, [rolesQuery.data, selectedRoleKey]);
++
++  const filteredRoles = useMemo(() => {
++    const query = roleSearch.trim().toLowerCase();
++    if (!query) return roles;
++    return roles.filter((role) =>
++      [role.roleKey, role.nameAr, role.nameEn, role.description]
++        .filter(Boolean)
++        .some((value) => String(value).toLowerCase().includes(query)),
++    );
++  }, [roles, roleSearch]);
++
++  const filteredModules = useMemo(() => {
++    const query = moduleSearch.trim().toLowerCase();
++    if (!query) return modules;
++    return modules.filter((module) => {
++      const label = MODULE_LABELS[module];
++      return [module, label.ar, label.en].some((value) => value.toLowerCase().includes(query));
++    });
++  }, [modules, moduleSearch]);
++
++  const grantedCount = useMemo(() => {
++    if (!draft) return 0;
++    return modules.reduce(
++      (total, module) =>
++        total + actions.filter((action) => Boolean(draft.permissions[module]?.[action])).length,
++      0,
++    );
++  }, [actions, draft, modules]);
++
++  const totalCount = modules.length * actions.length;
++  const busy = saveRoleMutation.isPending || deleteRoleMutation.isPending;
++
++  function selectRole(role: any) {
++    setNotice(null);
++    setSelectedRoleKey(String(role.roleKey));
++    setDraft(roleToDraft(role));
++  }
++
++  function startNewRole() {
++    setNotice(null);
++    setSelectedRoleKey("__new__");
++    setDraft(newRoleDraft());
++  }
++
++  function resetDraft() {
++    if (!draft) return;
++    if (draft.isNew) {
++      setDraft(newRoleDraft());
++      return;
++    }
++    const role = roles.find((item) => String(item.roleKey) === draft.roleKey);
++    if (role) setDraft(roleToDraft(role));
++  }
++
++  function updateAction(module: TtcrmRbacModule, action: TtcrmRbacAction, checked: boolean) {
++    if (!draft || draft.locked) return;
++    setDraft({
++      ...draft,
++      permissions: {
++        ...draft.permissions,
++        [module]: {
++          ...draft.permissions[module],
++          [action]: checked,
++        },
++      },
++    });
++  }
++
++  function updateScope(module: TtcrmRbacModule, dataScope: TtcrmDataScope) {
++    if (!draft || draft.locked) return;
++    setDraft({
++      ...draft,
++      permissions: {
++        ...draft.permissions,
++        [module]: {
++          ...draft.permissions[module],
++          dataScope,
++        },
++      },
++    });
++  }
++
++  function setAllActions(module: TtcrmRbacModule, enabled: boolean) {
++    if (!draft || draft.locked) return;
++    const next = { ...draft.permissions[module] };
++    for (const action of actions) next[action] = enabled;
++    setDraft({
++      ...draft,
++      permissions: {
++        ...draft.permissions,
++        [module]: next,
++      },
++    });
++  }
++
++  async function saveRole() {
++    if (!draft || draft.locked) return;
++    const roleKey = draft.roleKey.trim();
++    const nameEn = draft.nameEn.trim();
++    if (!roleKey || !nameEn) {
++      setNotice(isRTL ? "Role Key والاسم الإنجليزي مطلوبان." : "Role key and English name are required.");
++      return;
++    }
++    if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(roleKey)) {
++      setNotice(
++        isRTL
++          ? "Role Key يجب أن يبدأ بحرف ويحتوي على حروف أو أرقام أو _ أو - فقط."
++          : "Role key must start with a letter and contain only letters, numbers, _ or -.",
++      );
++      return;
++    }
++
++    setNotice(null);
++    try {
++      await saveRoleMutation.mutateAsync({
++        roleKey,
++        nameAr: draft.nameAr.trim() || null,
++        nameEn,
++        description: draft.description.trim() || null,
++        permissions: modules.map((module) => ({
++          module,
++          view: Boolean(draft.permissions[module].view),
++          create: Boolean(draft.permissions[module].create),
++          edit: Boolean(draft.permissions[module].edit),
++          delete: Boolean(draft.permissions[module].delete),
++          export: Boolean(draft.permissions[module].export),
++          approve: Boolean(draft.permissions[module].approve),
++          assign: Boolean(draft.permissions[module].assign),
++          dataScope: draft.permissions[module].dataScope,
++        })),
++      });
++      await Promise.all([utils.rbac.listRoles.invalidate(), utils.rbac.me.invalidate()]);
++      setSelectedRoleKey(roleKey);
++      setNotice(isRTL ? "تم حفظ الدور والصلاحيات بنجاح." : "Role and permissions saved successfully.");
++    } catch (error: any) {
++      setNotice(error?.message || (isRTL ? "تعذر حفظ الدور." : "Could not save role."));
++    }
++  }
++
++  async function disableRole() {
++    if (!draft || draft.isNew || draft.isSystem || draft.locked) return;
++    const confirmed =
++      typeof window === "undefined" ||
++      window.confirm(
++        isRTL
++          ? `تعطيل الدور ${draft.nameAr || draft.nameEn || draft.roleKey}؟`
++          : `Disable role ${draft.nameEn || draft.roleKey}?`,
++      );
++    if (!confirmed) return;
++
++    setNotice(null);
++    try {
++      await deleteRoleMutation.mutateAsync({ roleKey: draft.roleKey });
++      await Promise.all([utils.rbac.listRoles.invalidate(), utils.rbac.me.invalidate()]);
++      setSelectedRoleKey("Admin");
++      setNotice(isRTL ? "تم تعطيل الدور المخصص." : "Custom role disabled.");
++    } catch (error: any) {
++      setNotice(error?.message || (isRTL ? "تعذر تعطيل الدور." : "Could not disable role."));
++    }
++  }
++
++  const apiError =
++    rolesQuery.error?.message ||
++    catalogQuery.error?.message ||
++    saveRoleMutation.error?.message ||
++    deleteRoleMutation.error?.message;
++
++  if (rolesQuery.isLoading || catalogQuery.isLoading) {
++    return (
++      <Card className="rounded-2xl">
++        <CardContent className="flex min-h-56 items-center justify-center gap-3 text-sm text-muted-foreground">
++          <RefreshCw className="h-4 w-4 animate-spin" />
++          {isRTL ? "جاري تحميل نظام الصلاحيات..." : "Loading RBAC..."}
++        </CardContent>
++      </Card>
++    );
++  }
++
++  if (rolesQuery.error || catalogQuery.error) {
++    return (
++      <Card className="rounded-2xl border-destructive/40">
++        <CardContent className="p-6">
++          <div className="flex items-start gap-3 text-destructive">
++            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" />
++            <div>
++              <div className="font-semibold">{isRTL ? "تعذر تحميل الصلاحيات" : "Could not load permissions"}</div>
++              <div className="mt-1 text-sm opacity-80">{apiError}</div>
++            </div>
++          </div>
++        </CardContent>
++      </Card>
++    );
++  }
++
++  return (
++    <div className="space-y-4" dir={isRTL ? "rtl" : "ltr"}>
++      <div className="flex flex-col gap-3 rounded-2xl border bg-card px-5 py-4 shadow-sm lg:flex-row lg:items-center lg:justify-between">
++        <div>
++          <div className="flex items-center gap-2">
++            <ShieldCheck className="h-6 w-6 text-primary" />
++            <h2 className="text-xl font-bold">{isRTL ? "إدارة الأدوار والصلاحيات" : "Roles & Permissions"}</h2>
++          </div>
++          <p className="mt-1 text-xs text-muted-foreground">
++            {isRTL
++              ? "تحكم ديناميكي في Module × Action ونطاق البيانات. تعيين المستخدمين للأدوار سيتم في المرحلة التالية."
++              : "Dynamic Module × Action permissions with data scope. User-role assignment is handled in the next phase."}
++          </p>
++        </div>
++        <Button className="gap-2" onClick={startNewRole}>
++          <Plus className="h-4 w-4" />
++          {isRTL ? "دور مخصص جديد" : "New Custom Role"}
++        </Button>
++      </div>
++
++      {(notice || apiError) && (
++        <div className="rounded-xl border bg-muted/30 px-4 py-3 text-sm">
++          {notice || apiError}
++        </div>
++      )}
++
++      <div className="grid gap-4 xl:grid-cols-[280px_minmax(0,1fr)]">
++        <Card className="h-fit rounded-2xl xl:sticky xl:top-4">
++          <CardHeader className="border-b pb-3">
++            <div className="flex items-center justify-between gap-2">
++              <CardTitle className="text-base">{isRTL ? "الأدوار" : "Roles"}</CardTitle>
++              <Badge variant="outline">{roles.length}</Badge>
++            </div>
++            <div className="relative pt-2">
++              <Search className="absolute start-3 top-1/2 h-4 w-4 -translate-y-0.5 text-muted-foreground" />
++              <Input
++                className="ps-9"
++                value={roleSearch}
++                onChange={(event) => setRoleSearch(event.target.value)}
++                placeholder={isRTL ? "بحث في الأدوار..." : "Search roles..."}
++              />
++            </div>
++          </CardHeader>
++          <CardContent className="max-h-[68vh] space-y-2 overflow-y-auto p-3">
++            {filteredRoles.map((role) => {
++              const key = String(role.roleKey);
++              const active = selectedRoleKey === key && !draft?.isNew;
++              return (
++                <button
++                  type="button"
++                  key={key}
++                  onClick={() => selectRole(role)}
++                  className={[
++                    "w-full rounded-xl border p-3 text-start transition",
++                    active ? "border-primary bg-primary/5 ring-1 ring-primary/20" : "hover:bg-muted/30",
++                  ].join(" ")}
++                >
++                  <div className="flex items-start justify-between gap-2">
++                    <div className="min-w-0">
++                      <div className="truncate text-sm font-semibold">
++                        {isRTL ? role.nameAr || role.nameEn || key : role.nameEn || role.nameAr || key}
++                      </div>
++                      <div className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">{key}</div>
++                    </div>
++                    <div className="flex shrink-0 gap-1">
++                      {Boolean(role.isSystem) && (
++                        <Badge variant="secondary" className="text-[9px]">
++                          {isRTL ? "نظام" : "System"}
++                        </Badge>
++                      )}
++                      {key === "Admin" && <LockKeyhole className="h-4 w-4 text-muted-foreground" />}
++                    </div>
++                  </div>
++                </button>
++              );
++            })}
++            {draft?.isNew && (
++              <div className="rounded-xl border border-primary bg-primary/5 p-3 text-sm font-semibold">
++                {isRTL ? "دور مخصص جديد" : "New custom role"}
++              </div>
++            )}
++          </CardContent>
++        </Card>
++
++        <div className="min-w-0 space-y-4">
++          {!draft ? (
++            <Card className="rounded-2xl">
++              <CardContent className="p-8 text-center text-sm text-muted-foreground">
++                {isRTL ? "لا توجد أدوار متاحة." : "No roles available."}
++              </CardContent>
++            </Card>
++          ) : (
++            <>
++              <Card className="rounded-2xl">
++                <CardHeader className="border-b pb-3">
++                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
++                    <div>
++                      <CardTitle className="flex items-center gap-2 text-base">
++                        {draft.locked && <LockKeyhole className="h-4 w-4" />}
++                        {draft.isNew
++                          ? isRTL
++                            ? "إنشاء دور مخصص"
++                            : "Create Custom Role"
++                          : isRTL
++                            ? "بيانات الدور"
++                            : "Role Details"}
++                      </CardTitle>
++                      <p className="mt-1 text-xs text-muted-foreground">
++                        {draft.locked
++                          ? isRTL
++                            ? "Admin دور محمي ولا يمكن تعديل صلاحياته."
++                            : "Admin is protected and cannot be modified."
++                          : draft.isSystem
++                            ? isRTL
++                              ? "دور نظام: يمكن تعديل مصفوفة الصلاحيات، ولا يمكن تعطيله."
++                              : "System role: permissions can be edited, but the role cannot be disabled."
++                            : isRTL
++                              ? "دور مخصص قابل للتعديل أو التعطيل."
++                              : "Custom role can be edited or disabled."}
++                      </p>
++                    </div>
++                    <div className="flex flex-wrap gap-2">
++                      <Button variant="outline" className="gap-2" onClick={resetDraft} disabled={busy}>
++                        <RefreshCw className="h-4 w-4" />
++                        {isRTL ? "تراجع" : "Reset"}
++                      </Button>
++                      {!draft.isNew && !draft.isSystem && !draft.locked && (
++                        <Button variant="destructive" className="gap-2" onClick={disableRole} disabled={busy}>
++                          <Trash2 className="h-4 w-4" />
++                          {isRTL ? "تعطيل الدور" : "Disable Role"}
++                        </Button>
++                      )}
++                      {!draft.locked && (
++                        <Button className="gap-2" onClick={saveRole} disabled={busy}>
++                          <Save className="h-4 w-4" />
++                          {saveRoleMutation.isPending
++                            ? isRTL
++                              ? "جارٍ الحفظ..."
++                              : "Saving..."
++                            : isRTL
++                              ? "حفظ الصلاحيات"
++                              : "Save Permissions"}
++                        </Button>
++                      )}
++                    </div>
++                  </div>
++                </CardHeader>
++                <CardContent className="grid gap-4 p-4 md:grid-cols-2">
++                  <div>
++                    <Label>{isRTL ? "Role Key" : "Role Key"}</Label>
++                    <Input
++                      className="mt-2 font-mono"
++                      value={draft.roleKey}
++                      disabled={!draft.isNew || draft.locked}
++                      onChange={(event) => setDraft({ ...draft, roleKey: event.target.value })}
++                      placeholder="SalesSupervisor"
++                    />
++                  </div>
++                  <div>
++                    <Label>{isRTL ? "الاسم بالإنجليزية" : "English Name"}</Label>
++                    <Input
++                      className="mt-2"
++                      value={draft.nameEn}
++                      disabled={draft.locked}
++                      onChange={(event) => setDraft({ ...draft, nameEn: event.target.value })}
++                    />
++                  </div>
++                  <div>
++                    <Label>{isRTL ? "الاسم بالعربية" : "Arabic Name"}</Label>
++                    <Input
++                      className="mt-2"
++                      value={draft.nameAr}
++                      disabled={draft.locked}
++                      onChange={(event) => setDraft({ ...draft, nameAr: event.target.value })}
++                    />
++                  </div>
++                  <div>
++                    <Label>{isRTL ? "الوصف" : "Description"}</Label>
++                    <Input
++                      className="mt-2"
++                      value={draft.description}
++                      disabled={draft.locked}
++                      onChange={(event) => setDraft({ ...draft, description: event.target.value })}
++                    />
++                  </div>
++                </CardContent>
++              </Card>
++
++              <Card className="overflow-hidden rounded-2xl">
++                <CardHeader className="border-b pb-3">
++                  <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
++                    <div>
++                      <CardTitle className="text-base">{isRTL ? "مصفوفة الصلاحيات" : "Permission Matrix"}</CardTitle>
++                      <p className="mt-1 text-xs text-muted-foreground">
++                        {grantedCount} / {totalCount} {isRTL ? "صلاحية مفعلة" : "actions enabled"}
++                      </p>
++                    </div>
++                    <div className="relative md:w-72">
++                      <Search className="absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
++                      <Input
++                        className="ps-9"
++                        value={moduleSearch}
++                        onChange={(event) => setModuleSearch(event.target.value)}
++                        placeholder={isRTL ? "بحث في الوحدات..." : "Search modules..."}
++                      />
++                    </div>
++                  </div>
++                </CardHeader>
++                <CardContent className="p-0">
++                  <div className="overflow-x-auto">
++                    <table className="w-full min-w-[1050px] text-sm">
++                      <thead>
++                        <tr className="border-b bg-muted/30">
++                          <th className="sticky start-0 z-10 min-w-[190px] bg-muted/30 px-4 py-3 text-start text-xs font-semibold">
++                            {isRTL ? "الوحدة" : "Module"}
++                          </th>
++                          {actions.map((action) => (
++                            <th key={action} className="min-w-[82px] px-2 py-3 text-center text-xs font-medium text-muted-foreground">
++                              {isRTL ? ACTION_LABELS[action].ar : ACTION_LABELS[action].en}
++                            </th>
++                          ))}
++                          <th className="min-w-[150px] px-3 py-3 text-center text-xs font-medium text-muted-foreground">
++                            {isRTL ? "نطاق البيانات" : "Data Scope"}
++                          </th>
++                          <th className="min-w-[90px] px-3 py-3 text-center text-xs font-medium text-muted-foreground">
++                            {isRTL ? "الكل" : "All"}
++                          </th>
++                        </tr>
++                      </thead>
++                      <tbody>
++                        {filteredModules.map((module) => {
++                          const grant = draft.permissions[module];
++                          const allEnabled = actions.every((action) => Boolean(grant[action]));
++                          return (
++                            <tr key={module} className="border-b last:border-b-0 hover:bg-muted/20">
++                              <td className="sticky start-0 z-10 bg-card px-4 py-3">
++                                <div className="font-medium">
++                                  {isRTL ? MODULE_LABELS[module].ar : MODULE_LABELS[module].en}
++                                </div>
++                                <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">{module}</div>
++                              </td>
++                              {actions.map((action) => (
++                                <td key={action} className="px-2 py-3 text-center">
++                                  <input
++                                    type="checkbox"
++                                    className="h-4 w-4 accent-primary"
++                                    checked={Boolean(grant[action])}
++                                    disabled={draft.locked}
++                                    onChange={(event) => updateAction(module, action, event.target.checked)}
++                                    aria-label={`${module}.${action}`}
++                                  />
++                                </td>
++                              ))}
++                              <td className="px-3 py-3">
++                                <Select
++                                  value={grant.dataScope}
++                                  disabled={draft.locked}
++                                  onValueChange={(value) => updateScope(module, value as TtcrmDataScope)}
++                                >
++                                  <SelectTrigger className="h-8">
++                                    <SelectValue />
++                                  </SelectTrigger>
++                                  <SelectContent>
++                                    {dataScopes.map((scope) => (
++                                      <SelectItem key={scope} value={scope}>
++                                        {isRTL ? SCOPE_LABELS[scope].ar : SCOPE_LABELS[scope].en}
++                                      </SelectItem>
++                                    ))}
++                                  </SelectContent>
++                                </Select>
++                              </td>
++                              <td className="px-3 py-3 text-center">
++                                <input
++                                  type="checkbox"
++                                  className="h-4 w-4 accent-primary"
++                                  checked={allEnabled}
++                                  disabled={draft.locked}
++                                  onChange={(event) => setAllActions(module, event.target.checked)}
++                                  aria-label={`${module}.all`}
++                                />
++                              </td>
++                            </tr>
++                          );
++                        })}
++                      </tbody>
++                    </table>
++                  </div>
++                </CardContent>
++              </Card>
++
++              <div className="grid gap-3 md:grid-cols-2">
++                <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-100">
++                  <div className="flex items-start gap-2">
++                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
++                    <div>
++                      <div className="font-semibold">{isRTL ? "ملاحظة Data Scope" : "Data Scope Note"}</div>
++                      <p className="mt-1 text-xs leading-5">
++                        {isRTL
++                          ? "نطاق Branch موجود للتوافق مع TAS لكنه Fail-Closed حاليًا حتى يتم تعريف عضوية الفروع في TTCRM."
++                          : "Branch scope is available for TAS parity but remains fail-closed until TTCRM branch membership is configured."}
++                      </p>
++                    </div>
++                  </div>
++                </div>
++                <div className="rounded-2xl border bg-card p-4 text-sm">
++                  <div className="flex items-start gap-2">
++                    <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
++                    <div>
++                      <div className="font-semibold">{isRTL ? "حماية الـ Backend" : "Backend Enforcement"}</div>
++                      <p className="mt-1 text-xs leading-5 text-muted-foreground">
++                        {isRTL
++                          ? "هذه المصفوفة تُحفظ في جداول RBAC ويقرأها rbac.me والـ backend guards؛ إخفاء الواجهة ليس مصدر الحماية الوحيد."
++                          : "This matrix is persisted in RBAC tables and consumed by rbac.me/backend guards; UI hiding is not the only protection layer."}
++                      </p>
++                    </div>
++                  </div>
++                </div>
++              </div>
++            </>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
