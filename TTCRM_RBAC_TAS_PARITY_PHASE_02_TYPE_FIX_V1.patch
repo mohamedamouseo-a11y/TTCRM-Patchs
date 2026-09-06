@@ -1,0 +1,50 @@
+diff --git a/server/services/rbacService.ts b/server/services/rbacService.ts
+--- a/server/services/rbacService.ts
++++ b/server/services/rbacService.ts
+@@ -62,9 +62,10 @@ export async function getExplicitTtcrmRoleMatrix(roleKey: string): Promise<Ttcr
+ 
+     const matrix: TtcrmPermissionMatrix = {};
+     for (const row of rows) {
+       if (!isKnownModule(row.moduleKey)) continue;
+-      matrix[row.moduleKey] = {
++      const moduleKey = String(row.moduleKey) as TtcrmRbacModule;
++      matrix[moduleKey] = {
+         view: Boolean(row.canView),
+         create: Boolean(row.canCreate),
+         edit: Boolean(row.canEdit),
+         delete: Boolean(row.canDelete),
+         export: Boolean(row.canExport),
+diff --git a/server/rbacRouter.ts b/server/rbacRouter.ts
+--- a/server/rbacRouter.ts
++++ b/server/rbacRouter.ts
+@@ -1,5 +1,6 @@
+ import { protectedProcedure, router } from "./_core/trpc";
++import { TRPCError } from "@trpc/server";
+ import { normalizeUserRole } from "../shared/permissions";
+ import { TTCRM_DATA_SCOPES, TTCRM_RBAC_ACTIONS, TTCRM_RBAC_MODULES } from "../shared/rbac";
+ import { getEffectiveTtcrmPermissions } from "./services/rbacService";
+@@ -10,12 +11,17 @@ export const rbacRouter = router({
+     dataScopes: TTCRM_DATA_SCOPES,
+   })),
+ 
+-  me: protectedProcedure.query(async ({ ctx }) => ({
+-    role: normalizeUserRole(ctx.user.role),
+-    permissions: await getEffectiveTtcrmPermissions({
+-      id: ctx.user.id,
+-      role: ctx.user.role,
+-    }),
+-  })),
++  me: protectedProcedure.query(async ({ ctx }) => {
++    const user = ctx.user;
++    if (!user) {
++      throw new TRPCError({ code: "UNAUTHORIZED", message: "Authentication required" });
++    }
++    return {
++      role: normalizeUserRole(user.role),
++      permissions: await getEffectiveTtcrmPermissions({
++        id: user.id,
++        role: user.role,
++      }),
++    };
++  }),
+ });
