@@ -1,0 +1,278 @@
+diff --git a/server/_core/trpc.ts b/server/_core/trpc.ts
+--- a/server/_core/trpc.ts
++++ b/server/_core/trpc.ts
+@@ -1,15 +1,23 @@
+ import { hasRolePermission, AppPermission } from "../../shared/permissions";
+ import type { TtcrmRbacAction, TtcrmRbacModule } from "../../shared/rbac";
+-import { hasEffectiveTtcrmPermission } from "../services/rbacService";
++import { requireEffectiveTtcrmPermission } from "../services/rbacService";
++import { enforceTtcrmRequestScope } from "../services/rbacDataScope";
+ import { NOT_ADMIN_ERR_MSG, UNAUTHED_ERR_MSG } from '@shared/const';
+ 
+ export const rbacProcedure = (module: TtcrmRbacModule, action: TtcrmRbacAction) =>
+   protectedProcedure.use(
+     t.middleware(async (opts) => {
+       const { ctx, next } = opts;
+-      if (!ctx.user || !(await hasEffectiveTtcrmPermission(ctx.user, module, action))) {
+-        throw new TRPCError({ code: "FORBIDDEN", message: `Forbidden: Missing required permission: ${module}.${action}` });
++      if (!ctx.user) {
++        throw new TRPCError({ code: "UNAUTHORIZED", message: UNAUTHED_ERR_MSG });
+       }
++
++      const dataScope = await requireEffectiveTtcrmPermission(ctx.user, module, action);
++      const rawInput = (opts as any).getRawInput
++        ? await (opts as any).getRawInput().catch(() => undefined)
++        : undefined;
++      await enforceTtcrmRequestScope(ctx.user.id, dataScope, rawInput);
++
+       return next({ ctx });
+     }),
+   );
+diff --git a/server/services/rbacDataScope.ts b/server/services/rbacDataScope.ts
+new file mode 100644
+--- /dev/null
++++ b/server/services/rbacDataScope.ts
+@@ -0,0 +1,243 @@
++import { TRPCError } from "@trpc/server";
++import { sql } from "drizzle-orm";
++import type { TtcrmDataScope } from "../../shared/rbac";
++import { getDb } from "../db";
++
++const USER_TARGET_KEYS = new Set([
++  "userId",
++  "ownerId",
++  "assignedTo",
++  "assignedUserId",
++  "assignedToUserId",
++  "salesAgentId",
++  "agentId",
++  "accountManagerId",
++  "createdBy",
++  "createdByUserId",
++  "scopeUserId",
++  "targetUserId",
++  "toUserId",
++  "assigneeId",
++]);
++
++function rowsOf(result: any): any[] {
++  return ((result as any)?.[0] ?? []) as any[];
++}
++
++function asPositiveInt(value: unknown): number | null {
++  const parsed = Number(value);
++  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
++}
++
++export function collectTtcrmTargetUserIds(
++  input: unknown,
++  output = new Set<number>(),
++  depth = 0,
++): Set<number> {
++  if (depth > 5 || input == null) return output;
++
++  if (Array.isArray(input)) {
++    for (const value of input) collectTtcrmTargetUserIds(value, output, depth + 1);
++    return output;
++  }
++
++  if (typeof input !== "object") return output;
++
++  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
++    if (USER_TARGET_KEYS.has(key)) {
++      const id = asPositiveInt(value);
++      if (id) output.add(id);
++      continue;
++    }
++    if (value && typeof value === "object") {
++      collectTtcrmTargetUserIds(value, output, depth + 1);
++    }
++  }
++
++  return output;
++}
++
++export async function getTtcrmUserTeamId(userId: number): Promise<number | null> {
++  const db = await getDb();
++  if (!db) {
++    throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++  }
++
++  const result = await db.execute(sql`
++    SELECT teamId
++    FROM users
++    WHERE id = ${userId} AND deletedAt IS NULL AND isActive = 1
++    LIMIT 1
++  `);
++  return asPositiveInt(rowsOf(result)[0]?.teamId);
++}
++
++export async function resolveTtcrmScopeUserIds(
++  userId: number,
++  scope: TtcrmDataScope,
++): Promise<number[] | null> {
++  if (scope === "all") return null;
++
++  if (scope === "branch") {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Branch-scoped access is fail-closed until explicit user-to-branch membership is configured",
++    });
++  }
++
++  if (scope === "own" || scope === "assigned") return [userId];
++
++  const teamId = await getTtcrmUserTeamId(userId);
++  if (!teamId) {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Team-scoped access requires the current user to belong to a team",
++    });
++  }
++
++  const db = await getDb();
++  if (!db) {
++    throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database is unavailable" });
++  }
++
++  const result = await db.execute(sql`
++    SELECT id
++    FROM users
++    WHERE teamId = ${teamId} AND deletedAt IS NULL AND isActive = 1
++  `);
++  const ids = rowsOf(result)
++    .map((row) => asPositiveInt(row.id))
++    .filter((id): id is number => id !== null);
++
++  if (!ids.includes(userId)) ids.push(userId);
++  return ids;
++}
++
++export async function enforceTtcrmRequestScope(
++  userId: number,
++  scope: TtcrmDataScope,
++  input: unknown,
++): Promise<void> {
++  if (scope === "all") return;
++
++  if (scope === "branch") {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Branch-scoped access is fail-closed until explicit user-to-branch membership is configured",
++    });
++  }
++
++  const targets = [...collectTtcrmTargetUserIds(input)];
++  if (!targets.length) return;
++
++  if (scope === "own" || scope === "assigned") {
++    if (targets.some((id) => id !== userId)) {
++      throw new TRPCError({
++        code: "FORBIDDEN",
++        message: `Data scope ${scope} does not allow targeting another user`,
++      });
++    }
++    return;
++  }
++
++  const allowedUserIds = await resolveTtcrmScopeUserIds(userId, "team");
++  const allowed = new Set(allowedUserIds ?? []);
++  if (targets.some((id) => !allowed.has(id))) {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Target user is outside the permitted team scope",
++    });
++  }
++}
++
++export type TtcrmScopeSubject = {
++  userId?: number | null;
++  ownerId?: number | null;
++  assignedTo?: number | null;
++  assignedUserId?: number | null;
++  accountManagerId?: number | null;
++  createdBy?: number | null;
++  createdByUserId?: number | null;
++  teamId?: number | null;
++  branchId?: number | null;
++};
++
++function subjectUserIds(subject: TtcrmScopeSubject): number[] {
++  return [
++    subject.userId,
++    subject.ownerId,
++    subject.assignedTo,
++    subject.assignedUserId,
++    subject.accountManagerId,
++    subject.createdBy,
++    subject.createdByUserId,
++  ]
++    .map(asPositiveInt)
++    .filter((id): id is number => id !== null);
++}
++
++export async function assertTtcrmRecordScope(
++  userId: number,
++  scope: TtcrmDataScope,
++  subject: TtcrmScopeSubject,
++): Promise<void> {
++  if (scope === "all") return;
++
++  if (scope === "branch") {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Branch-scoped record access is fail-closed until explicit branch membership is configured",
++    });
++  }
++
++  if (scope === "own") {
++    const owners = [subject.userId, subject.ownerId, subject.createdBy, subject.createdByUserId]
++      .map(asPositiveInt)
++      .filter((id): id is number => id !== null);
++    if (!owners.length || !owners.includes(userId)) {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Record is outside own data scope" });
++    }
++    return;
++  }
++
++  if (scope === "assigned") {
++    const assignees = [subject.assignedTo, subject.assignedUserId, subject.accountManagerId, subject.userId]
++      .map(asPositiveInt)
++      .filter((id): id is number => id !== null);
++    if (!assignees.length || !assignees.includes(userId)) {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Record is outside assigned data scope" });
++    }
++    return;
++  }
++
++  const actorTeamId = await getTtcrmUserTeamId(userId);
++  if (!actorTeamId) {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Team-scoped access requires the current user to belong to a team",
++    });
++  }
++
++  const explicitTeamId = asPositiveInt(subject.teamId);
++  if (explicitTeamId) {
++    if (explicitTeamId !== actorTeamId) {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Record is outside the permitted team scope" });
++    }
++    return;
++  }
++
++  const relatedUserIds = subjectUserIds(subject);
++  if (!relatedUserIds.length) {
++    throw new TRPCError({
++      code: "FORBIDDEN",
++      message: "Team scope cannot be verified for this record",
++    });
++  }
++
++  for (const relatedUserId of relatedUserIds) {
++    const relatedTeamId = await getTtcrmUserTeamId(relatedUserId);
++    if (!relatedTeamId || relatedTeamId !== actorTeamId) {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Record is outside the permitted team scope" });
++    }
++  }
++}
