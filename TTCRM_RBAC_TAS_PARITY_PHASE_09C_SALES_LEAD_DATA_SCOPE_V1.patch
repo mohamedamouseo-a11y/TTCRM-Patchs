@@ -1,0 +1,251 @@
+diff --git a/server/db.ts b/server/db.ts
+--- a/server/db.ts
++++ b/server/db.ts
+@@ -4,6 +4,7 @@
+   unassignedOnly?: boolean;
+   taraPendingDistributionOnly?: boolean;
+   assignedUserId?: number;
++  assignedUserIds?: number[];
+   stage?: string;
+   leadQuality?: string;
+   fitStatus?: string;
+@@ -18,6 +19,34 @@
+   offset?: number;
+ }
+ 
++async function applyLeadUserScopeCondition(db: any, conditions: any[], userIds: number[]) {
++  const normalizedUserIds = [...new Set(
++    userIds.map(Number).filter((id) => Number.isInteger(id) && id > 0),
++  )];
++  if (!normalizedUserIds.length) {
++    conditions.push(sql`1 = 0`);
++    return;
++  }
++
++  const assignedRows = await db
++    .select({ leadId: leadAssignments.leadId })
++    .from(leadAssignments)
++    .where(and(
++      inArray(leadAssignments.userId, normalizedUserIds),
++      eq(leadAssignments.isActive, 1 as any),
++    ));
++  const assignedLeadIds = [...new Set(
++    assignedRows.map((row: any) => Number(row.leadId)).filter((id: number) => Number.isInteger(id) && id > 0),
++  )];
++
++  const ownerCondition = inArray(leads.ownerId, normalizedUserIds);
++  conditions.push(
++    assignedLeadIds.length
++      ? or(ownerCondition, inArray(leads.id, assignedLeadIds))!
++      : ownerCondition,
++  );
++}
++
+ async function getWonLeadIdsInDealDateRange(db: any, dateFrom?: Date, dateTo?: Date): Promise<number[]> {
+@@ -27,23 +56,10 @@
+   if (!db) return [];
+ 
+   const conditions = [isNull(leads.deletedAt)];
+-  if (filters.assignedUserId) {
+-    // Show leads where user is owner OR has an active assignment
+-    const assignedLeadIds = await db.execute(sql`
+-      SELECT DISTINCT leadId FROM lead_assignments
+-      WHERE userId = ${filters.assignedUserId} AND isActive = 1
+-    `);
+-    const ids = ((assignedLeadIds as any)[0] ?? []).map((r: any) => r.leadId);
+-    if (ids.length > 0) {
+-      conditions.push(
+-        or(
+-          eq(leads.ownerId, filters.assignedUserId),
+-          inArray(leads.id, ids)
+-        )!
+-      );
+-    } else {
+-      conditions.push(eq(leads.ownerId, filters.assignedUserId));
+-    }
++  if (filters.assignedUserIds !== undefined) {
++    await applyLeadUserScopeCondition(db, conditions, filters.assignedUserIds);
++  } else if (filters.assignedUserId) {
++    await applyLeadUserScopeCondition(db, conditions, [filters.assignedUserId]);
+   } else if (filters.taraPendingDistributionOnly) {
+     conditions.push(isNull(leads.ownerId));
+@@ -55,23 +71,10 @@
+   if (!db) return 0;
+ 
+   const conditions = [isNull(leads.deletedAt)];
+-  if (filters.assignedUserId) {
+-    // Show leads where user is owner OR has an active assignment
+-    const assignedLeadIds = await db.execute(sql`
+-      SELECT DISTINCT leadId FROM lead_assignments
+-      WHERE userId = ${filters.assignedUserId} AND isActive = 1
+-    `);
+-    const ids = ((assignedLeadIds as any)[0] ?? []).map((r: any) => r.leadId);
+-    if (ids.length > 0) {
+-      conditions.push(
+-        or(
+-          eq(leads.ownerId, filters.assignedUserId),
+-          inArray(leads.id, ids)
+-        )!
+-      );
+-    } else {
+-      conditions.push(eq(leads.ownerId, filters.assignedUserId));
+-    }
++  if (filters.assignedUserIds !== undefined) {
++    await applyLeadUserScopeCondition(db, conditions, filters.assignedUserIds);
++  } else if (filters.assignedUserId) {
++    await applyLeadUserScopeCondition(db, conditions, [filters.assignedUserId]);
+   } else if (filters.taraPendingDistributionOnly) {
+     conditions.push(isNull(leads.ownerId));
+diff --git a/server/routers.ts b/server/routers.ts
+--- a/server/routers.ts
++++ b/server/routers.ts
+@@ -3,6 +3,78 @@
+   if (!db) return null;
+   const [row] = await db.select().from(table).where(eq(table.id, id)).limit(1);
+   return row ?? null;
++}
++
++async function resolveSalesLeadScope(ctx: any, action: "view" | "edit" | "delete") {
++  const { requireEffectiveTtcrmPermission } = await import("./services/rbacService");
++  return requireEffectiveTtcrmPermission(ctx.user, "sales", action);
++}
++
++async function applySalesLeadListScope(ctx: any, filters: any) {
++  const scope = await resolveSalesLeadScope(ctx, "view");
++  if (scope === "all") return filters;
++
++  filters.unassignedOnly = false;
++  filters.taraPendingDistributionOnly = false;
++  delete filters.assignedUserId;
++  delete filters.assignedUserIds;
++
++  if (scope === "own") {
++    filters.ownerId = ctx.user.id;
++    return filters;
++  }
++  if (scope === "assigned") {
++    delete filters.ownerId;
++    filters.assignedUserId = ctx.user.id;
++    return filters;
++  }
++
++  const { resolveTtcrmScopeUserIds } = await import("./services/rbacDataScope");
++  const userIds = await resolveTtcrmScopeUserIds(ctx.user.id, scope);
++  delete filters.ownerId;
++  filters.assignedUserIds = userIds ?? [];
++  return filters;
++}
++
++async function assertSalesLeadRecordScope(ctx: any, lead: any, action: "view" | "edit" | "delete") {
++  const scope = await resolveSalesLeadScope(ctx, action);
++  if (scope === "all") return;
++
++  const actorId = Number(ctx.user.id);
++  const ownerId = Number(lead?.ownerId ?? 0);
++  if (scope === "own") {
++    if (ownerId !== actorId) {
++      throw new TRPCError({ code: "FORBIDDEN", message: "Lead is outside own data scope" });
++    }
++    return;
++  }
++
++  const assignments = await getLeadAssignments(Number(lead.id));
++  const activeUserIds = assignments
++    .map((assignment: any) => Number(assignment.userId))
++    .filter((id: number) => Number.isInteger(id) && id > 0);
++
++  if (scope === "assigned") {
++    if (ownerId === actorId) return;
++    const access = await checkLeadAccess(Number(lead.id), actorId);
++    if (access.hasAccess && (action === "view" || access.permissions !== "view")) return;
++
++    const legacyRole = normalizeUserRole(ctx.user.role);
++    if (legacyRole === "PartsAgent") {
++      const rows = await listAutomotivePartsRequests({ leadId: Number(lead.id), assignedTo: actorId, limit: 1 });
++      if (rows.length) return;
++    }
++    if (legacyRole === "ServiceAdvisor") {
++      const rows = await listAutomotiveServiceBookings({ leadId: Number(lead.id), assignedTo: actorId, limit: 1 });
++      if (rows.length) return;
++    }
++    throw new TRPCError({ code: "FORBIDDEN", message: "Lead is outside assigned data scope" });
++  }
++
++  const { resolveTtcrmScopeUserIds } = await import("./services/rbacDataScope");
++  const teamUserIds = new Set(await resolveTtcrmScopeUserIds(actorId, scope) ?? []);
++  if (teamUserIds.has(ownerId) || activeUserIds.some((id: number) => teamUserIds.has(id))) return;
++  throw new TRPCError({ code: "FORBIDDEN", message: "Lead is outside team data scope" });
+ }
+ 
+ const salesReadProcedure = permissionProcedure("sales.view");
+@@ -2830,11 +2830,5 @@
+       .query(async ({ ctx, input }) => {
+-        const filters: any = { ...input };
+-        // ── ROW-LEVEL SECURITY ──
+-        if (isSalesAgentRole(ctx.user.role) || ctx.user.role === "AccountManager" || ctx.user.role === "AccountManagerLead") {
+-          // SalesAgent / AccountManager see only leads they own or are assigned to
+-          filters.assignedUserId = ctx.user.id;
+-        }
+-        // SalesManager sees all leads (no team filter needed for now since teamId is not widely used)
++        const filters = await applySalesLeadListScope(ctx, { ...input });
+         const [items, total] = await Promise.all([
+           getLeads(filters),
+           getLeadsCount(filters),
+@@ -2855,20 +2855,6 @@
+       .query(async ({ ctx, input }) => {
+         const lead = await getLeadById(input.id);
+         if (!lead) throw new TRPCError({ code: "NOT_FOUND" });
+-        // ── ROW-LEVEL SECURITY ──
+-        if (["SalesAgent","AccountManager","AccountManagerLead"].includes(String(ctx.user.role)) && lead.ownerId !== ctx.user.id) {
+-          const access = await checkLeadAccess(input.id, ctx.user.id);
+-          if (!access.hasAccess) {
+-            throw new TRPCError({ code: "FORBIDDEN", message: "Access denied: this lead is not assigned to you" });
+-          }
+-        }
+-        if (ctx.user.role === "PartsAgent") {
+-          const partsRows = await listAutomotivePartsRequests({ leadId: input.id, assignedTo: ctx.user.id, limit: 1 });
+-          if (!partsRows.length) throw new TRPCError({ code: "FORBIDDEN", message: "Access denied: this lead is outside your parts queue" });
+-        }
+-        if (ctx.user.role === "ServiceAdvisor") {
+-          const serviceRows = await listAutomotiveServiceBookings({ leadId: input.id, assignedTo: ctx.user.id, limit: 1 });
+-          if (!serviceRows.length) throw new TRPCError({ code: "FORBIDDEN", message: "Access denied: this lead is outside your service queue" });
+-        }
++        await assertSalesLeadRecordScope(ctx, lead, "view");
+         return lead;
+       }),
+@@ -2890,2 +2890,2 @@
+-    create: salesEditProcedure
++    create: permissionProcedure("sales.create")
+       .input(
+@@ -2930,14 +2930,5 @@
+         const { id, ...data } = input;
+-        // ── ROW-LEVEL SECURITY ──
+         const existingLead = await getLeadById(id);
+-        if (isSalesAgentRole(ctx.user.role)) {
+-          const sourceAccess = await checkLeadAccess(id, ctx.user.id);
+-          if (!existingLead || !sourceAccess.hasAccess || sourceAccess.permissions === "view") {
+-            throw new TRPCError({ code: "FORBIDDEN", message: "You can only edit leads assigned or shared with you" });
+-          }
+-          // SalesAgent cannot reassign leads to other agents
+-          if (data.ownerId !== undefined && data.ownerId !== ctx.user.id) {
+-            throw new TRPCError({ code: "FORBIDDEN", message: "You cannot reassign leads to other agents" });
+-          }
+-        }
++        if (!existingLead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found" });
++        await assertSalesLeadRecordScope(ctx, existingLead, "edit");
+         const sourceMetadata = existingLead?.sourceMetadata && typeof existingLead.sourceMetadata === "object"
+@@ -3060,11 +3060,7 @@
+-    delete: salesEditProcedure
++    delete: permissionProcedure("sales.delete")
+       .input(z.object({ id: z.number() }))
+       .mutation(async ({ ctx, input }) => {
+-        // SalesAgent can only delete their own leads
+         const lead = await getLeadById(input.id);
+-        if (isSalesAgentRole(ctx.user.role)) {
+-          if (!lead || lead.ownerId !== ctx.user.id) {
+-            throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete leads assigned to you" });
+-          }
+-        }
++        if (!lead) throw new TRPCError({ code: "NOT_FOUND", message: "Lead not found" });
++        await assertSalesLeadRecordScope(ctx, lead, "delete");
+         await deleteLead(input.id, ctx.user.id);
