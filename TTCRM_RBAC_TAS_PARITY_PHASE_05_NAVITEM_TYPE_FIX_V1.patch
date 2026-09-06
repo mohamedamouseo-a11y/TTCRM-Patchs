@@ -1,0 +1,11 @@
+diff --git a/client/src/components/CRMLayout.tsx b/client/src/components/CRMLayout.tsx
+--- a/client/src/components/CRMLayout.tsx
++++ b/client/src/components/CRMLayout.tsx
+@@ -66,6 +66,7 @@ interface NavItem {
+   roles?: string[];
+   badge?: number;
+   visible?: boolean;
++  permission?: AppPermission;
+ }
+ 
+ export default function CRMLayout({ children, title: _title }: { children: React.ReactNode; title?: string }) {
